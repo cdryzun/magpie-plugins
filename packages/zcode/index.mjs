@@ -209,8 +209,27 @@ async function preferStart(s, model, enabled) {
   return !jwtExpired(s.jwt) && startHasFlash(await flashAllowance(s))
 }
 
+// A Start Plan refusal is worth one Coding retry: its own words for an
+// exhausted or throttled plan, or a status that only ever means "not now".
+// An ordinary bad request (400) or a genuine server fault (503) goes back
+// to the agent untouched, so a broken turn never turns into a second one.
+const START_REFUSED = new Set([401, 403, 405, 429])
+const START_REFUSED_TEXT = /exceed|quota|rate.?limit|too many requests|insufficient|usage limit|limit reached|本轮|额度|限流/i
+
 function startRefused(status, text = "") {
-  return status === 405 || status === 429 || status === 502 && /exceed quota|quota limit|rate.?limit/i.test(text)
+  if (status === 200) return false
+  if (START_REFUSED.has(status)) return true
+  return status >= 400 && status < 600 && START_REFUSED_TEXT.test(text)
+}
+
+// refusalText reads what a refusal said, bounded: a vendor error is a short
+// JSON line, and nothing else about it is wanted.
+async function refusalText(res) {
+  try {
+    return (await res.clone().text()).slice(0, 4096)
+  } catch {
+    return ""
+  }
 }
 
 function restStart(s, retryAfter, now = Date.now()) {
@@ -1283,19 +1302,32 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
               h.set("x-api-key", key)
               h.set("Authorization", "Bearer " + key)
             }
-            let res = await fetch(url, { ...opts, headers: h })
-            if (startFlashFirst && start && s.key && typeof requestedModel === "string" && requestedModel.toLowerCase() === flashModel) {
-              const errorText = res.status === 502 ? await res.clone().text() : ""
-              if (startRefused(res.status, errorText)) {
-                restStart(s, res.headers.get("retry-after"))
-                await res.body?.cancel().catch(() => {})
-                const retryHeaders = new Headers(original.headers)
-                retryHeaders.delete("authorization")
-                retryHeaders.set("x-api-key", s.key)
-                retryHeaders.set("Authorization", "Bearer " + s.key)
-                const codingURL = s.base + url.slice(START_BASE.length)
-                res = await fetch(codingURL, { ...original, headers: retryHeaders })
-              }
+            // the same turn on the Coding Plan, as the agent sent it: only a
+            // Flash turn already on Start has a Coding plan to fall back to
+            const useStart = startFlashFirst && start && !!s.key && typeof requestedModel === "string" && requestedModel.toLowerCase() === flashModel
+            const onCoding = () => {
+              const retryHeaders = new Headers(original.headers)
+              retryHeaders.delete("authorization")
+              retryHeaders.set("x-api-key", s.key)
+              retryHeaders.set("Authorization", "Bearer " + s.key)
+              return fetch(s.base + url.slice(START_BASE.length), { ...original, headers: retryHeaders })
+            }
+            let res
+            try {
+              res = await fetch(url, { ...opts, headers: h })
+            } catch (e) {
+              // the Start Plan did not answer at all: the turn is still worth
+              // serving, unless the agent itself asked to stop
+              if (!useStart || opts.signal?.aborted) throw e
+              restStart(s, null)
+              res = await onCoding()
+            }
+            // only a refusal is read: a streaming answer must never be
+            // buffered to look for words it does not have
+            if (useStart && !res.ok && startRefused(res.status, await refusalText(res))) {
+              restStart(s, res.headers.get("retry-after"))
+              await res.body?.cancel().catch(() => {})
+              res = await onCoding()
             }
             // the plan's answer goes on as it came, the account kept: the
             // built-in never marked a ZCode account lapsed nor cleared one

@@ -27,6 +27,10 @@ const body = JSON.stringify({
 
 const envelope = (data) => Response.json({ code: 0, msg: "", data })
 const now = () => Math.trunc(Date.now() / 1000)
+// what the Start Plan answers a turn: at its limit by default, and whatever
+// a test needs it to be otherwise
+const refuse = () => new Response(JSON.stringify({ error: { message: "exceed quota limit" } }), { status: 429, headers: { "content-type": "application/json", "retry-after": "120" } })
+let startReply = refuse
 
 beforeAll(async () => {
   if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
@@ -46,8 +50,7 @@ beforeAll(async () => {
         })
       }
       if (path.endsWith("/subscription/list")) return envelope([{ status: "VALID", productName: "GLM Coding Max", autoRenew: true, nextRenewTime: "2027-07-09 16:00:00" }])
-      // the Start Plan refusing the turn, as it does at its limit
-      if (path.includes("/zcode-plan/")) return new Response(JSON.stringify({ error: { message: "exceed quota limit" } }), { status: 429, headers: { "content-type": "application/json", "retry-after": "120" } })
+      if (path.includes("/zcode-plan/")) return startReply()
       return Response.json({ type: "message", role: "assistant", content: [{ type: "text", text: "CODING" }] })
     },
   })
@@ -56,11 +59,12 @@ afterAll(() => server?.stop(true))
 
 const real = globalThis.fetch
 const HOSTS = ["https://zcode.z.ai", "https://api.z.ai", "https://open.bigmodel.cn"]
-const routeToFake = () => {
+const routeToFake = ({ dropStart = false } = {}) => {
   globalThis.fetch = (input, init) => {
     const url = input instanceof Request ? input.url : String(input)
     const host = HOSTS.find((h) => url.startsWith(h + "/"))
     if (!host) throw new Error("no network in tests: " + url)
+    if (dropStart && host === "https://zcode.z.ai" && url.includes("/anthropic/v1/messages")) throw new Error("connection reset")
     return real(`http://127.0.0.1:${server.port}/${new URL(host).host}${url.slice(host.length)}`, init)
   }
 }
@@ -68,6 +72,7 @@ const routeToFake = () => {
 afterEach(() => {
   globalThis.fetch = real
   got.length = 0
+  startReply = refuse
   internal.startPriority.clear()
   internal.routes.clear()
 })
@@ -119,4 +124,50 @@ test("the rest Start took from the refusal keeps the next turn on Coding", async
   expect(got.length).toBe(1)
   expect(got[0].path).toBe("/open.bigmodel.cn/api/anthropic/v1/messages")
   expect(internal.startPriority.get("coding-key\u0000" + jwt)?.restUntil).toBeGreaterThan(Date.now())
+})
+
+test("a refusal said with another status still falls back once", async () => {
+  // the old status-only rule handed a 403 back to the agent untouched
+  routeToFake()
+  startReply = () => Response.json({ error: { message: "usage limit reached" } }, { status: 403 })
+  const { res, json } = await call()
+  expect(res.status).toBe(200)
+  expect(json?.content?.[0]?.text).toBe("CODING")
+  const turns = got.filter((r) => r.path.endsWith("/messages"))
+  expect(turns.length).toBe(2)
+  expect(turns[1].path).toBe("/open.bigmodel.cn/api/anthropic/v1/messages")
+})
+
+test("a 200 that merely talks about quota stays the Start Plan's answer", async () => {
+  // a served turn is the vendor's answer: it is never read for a refusal
+  routeToFake()
+  startReply = () => Response.json({ error: { message: "quota exceeded" } }, { status: 200 })
+  const { res } = await call()
+  expect(res.status).toBe(200)
+  expect(got.filter((r) => r.path.endsWith("/messages")).length).toBe(1)
+})
+
+test("a network failure on Start still serves the turn from Coding", async () => {
+  routeToFake({ dropStart: true })
+  const { res, json } = await call()
+  expect(res.status).toBe(200)
+  expect(json?.content?.[0]?.text).toBe("CODING")
+  const turns = got.filter((r) => r.path.endsWith("/messages"))
+  expect(turns.length).toBe(1)
+  expect(turns[0].path).toBe("/open.bigmodel.cn/api/anthropic/v1/messages")
+  expect(turns[0].body).toBe(body)
+  expect(turns[0].headers["x-api-key"]).toBe("coding-key")
+  expect(internal.startPriority.get("coding-key\u0000" + jwt)?.restUntil).toBeGreaterThan(Date.now())
+})
+
+test("an ordinary client error is not turned into a second request", async () => {
+  routeToFake()
+  startReply = () => Response.json({ error: { message: "invalid model" } }, { status: 400 })
+  const { res } = await call()
+  expect(res.status).toBe(400)
+  const turns = got.filter((r) => r.path.endsWith("/messages"))
+  expect(turns.length).toBe(1)
+  expect(turns[0].path).toBe("/zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")
+  // the balance that let the turn go to Start is cached; no rest was taken
+  expect(internal.startPriority.get("coding-key\u0000" + jwt)?.restUntil).toBeUndefined()
 })

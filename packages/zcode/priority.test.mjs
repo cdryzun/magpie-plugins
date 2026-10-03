@@ -35,10 +35,17 @@ test("a missing or ended Start Plan is not eligible", () => {
 test("Start refuses rate limits and quota failures, not arbitrary server errors", () => {
   expect(startRefused(429)).toBe(true)
   expect(startRefused(405)).toBe(true)
+  expect(startRefused(403)).toBe(true)
+  expect(startRefused(401)).toBe(true)
   expect(startRefused(502, "exceed quota limit")).toBe(true)
+  expect(startRefused(400, "quota exceeded for glm-5.3-flash")).toBe(true)
+  expect(startRefused(500, "too many requests, slow down")).toBe(true)
+  expect(startRefused(502, "\u9650\u6d41")).toBe(true)
   expect(startRefused(502, "connection reset")).toBe(false)
   expect(startRefused(400, "invalid model")).toBe(false)
+  expect(startRefused(503, "service unavailable")).toBe(false)
   expect(startRefused(200)).toBe(false)
+  expect(startRefused(200, "exceed quota limit")).toBe(false)
 })
 
 test("an expired Start sign-in selects Coding without a balance request", async () => {
