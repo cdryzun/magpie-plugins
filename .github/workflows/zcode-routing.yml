@@ -1,0 +1,26 @@
+name: zcode-routing
+
+on:
+  push:
+    branches: [feat/glm-flash-start-priority]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun scripts/check.mjs
+      - name: Test with isolated credentials
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tempfile
+          with tempfile.TemporaryDirectory() as test_home:
+              result = subprocess.run(["bun", "test"], env={**os.environ, "HOME": test_home})
+              raise SystemExit(result.returncode)
+          PY

@@ -174,6 +174,52 @@ async function onStart(s) {
   return start
 }
 
+const flashModel = "glm-5.3-flash"
+const startPriority = new Map()
+
+function startHasFlash(usage, now = Date.now()) {
+  const until = Date.parse(usage?.until)
+  if (usage?.error || !Number.isFinite(until) || until <= now || !Array.isArray(usage?.windows)) return false
+  const windows = usage.windows.filter((w) => Array.isArray(w?.models) && w.models.some((m) => typeof m === "string" && m.toLowerCase() === flashModel))
+  return windows.length > 0 && windows.every((w) =>
+    typeof w.display === "string" && Number.isFinite(w.used) && w.used >= 0 && w.used < 100 &&
+    (!w.resetsAt || Date.parse(w.resetsAt) > now))
+}
+
+async function flashAllowance(s) {
+  const id = s.key + "\0" + s.jwt
+  let cached = startPriority.get(id)
+  if (cached?.restUntil > Date.now()) return null
+  if (cached?.loading) return cached.loading
+  if (cached && Date.now() - cached.at < 60_000) return cached.usage
+  cached = { at: Date.now(), usage: null }
+  startPriority.set(id, cached)
+  cached.loading = startUsage(s).catch(() => null).then((usage) => {
+    cached.usage = usage
+    delete cached.loading
+    return usage
+  })
+  return cached.loading
+}
+
+async function preferStart(s, model, enabled) {
+  if (!enabled || typeof model !== "string" || model.toLowerCase() !== flashModel || !s.key || !s.jwt || isTeam(s)) {
+    return onStart(s)
+  }
+  return startHasFlash(await flashAllowance(s))
+}
+
+function startRefused(status, text = "") {
+  return status === 405 || status === 429 || status === 502 && /exceed quota|quota limit|rate.?limit/i.test(text)
+}
+
+function restStart(s, retryAfter, now = Date.now()) {
+  const seconds = Number(retryAfter)
+  const until = Date.parse(retryAfter)
+  const wait = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : Number.isFinite(until) && until > now ? until - now : 15 * 60_000
+  startPriority.set(s.key + "\0" + s.jwt, { at: now, usage: null, restUntil: now + Math.min(wait, 60 * 60_000) })
+}
+
 // ---- keys ------------------------------------------------------------------------
 
 function teamHeaders(base, org, project) {
@@ -1139,7 +1185,7 @@ function dress(text, site, device) {
 
 // ---- the plugin ------------------------------------------------------------------
 
-export async function ZCodeAuthPlugin({ client }) {
+export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = {}) {
   const log = (message) => {
     try {
       client?.app?.log?.({ body: { service: "zcode-auth", level: "error", message } })
@@ -1196,7 +1242,15 @@ export async function ZCodeAuthPlugin({ client }) {
             if (!s) throw new Error("not signed in to ZCode")
             let url = input instanceof Request ? input.url : String(input)
             const opts = input instanceof Request ? { method: input.method, headers: input.headers, body: input.body, signal: input.signal, duplex: "half", ...init } : { ...init }
-            const start = await onStart(s)
+            const original = { ...opts }
+            if (opts.body != null && typeof opts.body !== "string") {
+              original.body = opts.body = await new Response(opts.body).text()
+              delete original.duplex
+              delete opts.duplex
+            }
+            let requestedModel
+            try { requestedModel = JSON.parse(original.body).model } catch {}
+            const start = await preferStart(s, requestedModel, startFlashFirst)
             // the request goes to the plan the account is on, wherever it was made for
             for (const b of [START_BASE, ZAI_BASE, BIGMODEL_BASE]) {
               if (url.startsWith(b)) {
@@ -1218,9 +1272,8 @@ export async function ZCodeAuthPlugin({ client }) {
               if (!s.jwt) throw new Error("ZCode's sign-in has no key; sign in again")
               // the Start Plan is served only to what looks like ZCode's own request
               startHeaders(h, s.jwt)
-              if (opts.body != null) {
-                const text = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
-                opts.body = dress(text, s.site, s.device)
+              if (original.body != null) {
+                opts.body = dress(original.body, s.site, s.device)
                 delete opts.duplex
                 h.delete("content-length")
               }
@@ -1230,7 +1283,20 @@ export async function ZCodeAuthPlugin({ client }) {
               h.set("x-api-key", key)
               h.set("Authorization", "Bearer " + key)
             }
-            const res = await fetch(url, { ...opts, headers: h })
+            let res = await fetch(url, { ...opts, headers: h })
+            if (startFlashFirst && start && s.key && typeof requestedModel === "string" && requestedModel.toLowerCase() === flashModel) {
+              const errorText = res.status === 502 ? await res.clone().text() : ""
+              if (startRefused(res.status, errorText)) {
+                restStart(s, res.headers.get("retry-after"))
+                await res.body?.cancel().catch(() => {})
+                const retryHeaders = new Headers(original.headers)
+                retryHeaders.delete("authorization")
+                retryHeaders.set("x-api-key", s.key)
+                retryHeaders.set("Authorization", "Bearer " + s.key)
+                const codingURL = s.base + url.slice(START_BASE.length)
+                res = await fetch(codingURL, { ...original, headers: retryHeaders })
+              }
+            }
             // the plan's answer goes on as it came, the account kept: the
             // built-in never marked a ZCode account lapsed nor cleared one
             const kept = new Headers(res.headers)
@@ -1270,7 +1336,16 @@ export async function ZCodeAuthPlugin({ client }) {
             return saved(await teamUsage(s, key))
           }
           if (await onStart(s)) return saved(await startUsage(s))
-          return saved(await codingUsage(s))
+          const coding = await codingUsage(s)
+          if (startFlashFirst && s.key && s.jwt && startHasFlash(await flashAllowance(s))) {
+            const allowance = await flashAllowance(s)
+            const others = Object.keys(provider?.models ?? {}).length ? Object.keys(provider.models) : MODELS.map((m) => m.id)
+            const codingModels = others.filter((m) => m.toLowerCase() !== flashModel)
+            coding.windows = codingModels.length ? (coding.windows ?? []).map((w) => ({ ...w, models: codingModels })) : []
+            coding.windows.push(...allowance.windows.filter((w) => Array.isArray(w?.models) && w.models.some((m) => typeof m === "string" && m.toLowerCase() === flashModel))
+              .map((w) => ({ ...w, name: "Start Plan / " + w.name, models: ["GLM-5.3-Flash"] })))
+          }
+          return saved(coding)
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
         }
@@ -1300,4 +1375,4 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT, startHasFlash, startRefused, restStart, startPriority }

@@ -103,3 +103,16 @@ it can't. To list a plugin, add an entry with its npm `package`, a
 `name`, `providers` (the provider ids it signs in to), an `icon` and a
 `summary` in English and Chinese (`{"en": …, "zh": …}`), and open a pull
 request.
+# ZCode Flash Start-First Fork
+
+The repository entry point enables Start Plan priority only for
+`GLM-5.3-Flash`. Install the repository at a pinned commit with Magpie:
+`magpie plugin add github:cdryzun/magpie-plugins#<commit>`.
+The matching package name replaces the official package source and retains
+the existing `zcode` sign-in.
+
+For Flash, an active, unexpired model allowance is used before Coding Plan.
+HTTP 429, HTTP 405, or HTTP 502 with a quota message retries the original
+request on Coding Plan once. Start is then rested for 15 minutes, or the
+server's Retry-After, capped at one hour. Other models keep their original
+plan selection. The upstream package entry point keeps its default policy.
