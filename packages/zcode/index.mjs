@@ -1369,13 +1369,18 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
           }
           if (await onStart(s)) return saved(await startUsage(s))
           const coding = await codingUsage(s)
-          if (startFlashFirst && s.key && s.jwt && startHasFlash(await flashAllowance(s))) {
-            const allowance = await flashAllowance(s)
+          if (startFlashFirst && s.key && s.jwt && !jwtExpired(s.jwt)) {
+            // A routing cooldown must not hide the Start Plan's balance.
+            const allowance = await startUsage(s).catch(() => null)
             const others = Object.keys(provider?.models ?? {}).length ? Object.keys(provider.models) : MODELS.map((m) => m.id)
             const codingModels = others.filter((m) => m.toLowerCase() !== flashModel)
-            coding.windows = codingModels.length ? (coding.windows ?? []).map((w) => ({ ...w, models: codingModels })) : []
-            coding.windows.push(...allowance.windows.filter((w) => Array.isArray(w?.models) && w.models.some((m) => typeof m === "string" && m.toLowerCase() === flashModel))
-              .map((w) => ({ ...w, name: "Start Plan / " + w.name, models: ["GLM-5.3-Flash"] })))
+            const flash = Date.parse(allowance?.until) > Date.now() && !allowance?.error && Array.isArray(allowance?.windows)
+              ? allowance.windows.filter((w) => Array.isArray(w?.models) && w.models.some((m) => typeof m === "string" && m.toLowerCase() === flashModel))
+              : []
+            if (flash.length) {
+              coding.windows = codingModels.length ? (coding.windows ?? []).map((w) => ({ ...w, models: codingModels })) : []
+              coding.windows.push(...flash.map((w) => ({ ...w, name: "Start Plan / " + w.name, models: ["GLM-5.3-Flash"] })))
+            }
           }
           return saved(coding)
         } catch (e) {

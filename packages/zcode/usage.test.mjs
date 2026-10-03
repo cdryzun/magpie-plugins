@@ -4,6 +4,7 @@
 import { test, expect, afterAll, beforeAll, beforeEach } from "bun:test"
 import { homedir, tmpdir } from "node:os"
 import { realpathSync } from "node:fs"
+import ZCodeStartFirst from "../../index.mjs"
 
 let ZCodeAuthPlugin, _internal
 beforeAll(async () => {
@@ -41,6 +42,37 @@ async function usage(auth, sets = []) {
   return hooks.auth.usage(async () => auth, { id: "zcode" })
 }
 const jwt = (exp) => ["{}", JSON.stringify({ exp })].map((s) => Buffer.from(s).toString("base64url")).join(".") + ".sig"
+
+test("a Start allowance remains on the Coding card during cooldown and after exhaustion", async () => {
+  const now = Math.trunc(Date.now() / 1000)
+  const token = jwt(now + 3600)
+  const auth = oauth({ site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", key: "coding-key", jwt: token, plan: "GLM Coding Max" })
+  let used = 200
+  serve(({ url }) => {
+    if (url.pathname.endsWith("/billing/balance")) return ok({
+      server_time: now, plans: [{ status: "active", plan_id: "start-plan", user_plan_id: "p1", ends_at: now + 3600 }],
+      balances: [{ plan_id: "start-plan", user_plan_id: "p1", total_units: 1000, used_units: used, expires_at: now + 3600, capabilities: ["model:glm-5.3-flash"] }],
+    })
+    if (url.pathname.endsWith("/api/monitor/usage/quota/limit")) return ok({ level: "max", limits: [{ type: "CREDIT_LIMIT", unit: 3, number: 5, percentage: 25 }] })
+    if (url.pathname.endsWith("/api/biz/subscription/list")) return ok([{ status: "VALID", productName: "GLM Coding Max" }])
+  })
+  const state = { key: "coding-key", jwt: token }
+  try {
+    const hooks = await ZCodeStartFirst({})
+    const quota = () => hooks.auth.usage(async () => auth, { id: "zcode", models: { "GLM-5.3": {}, "GLM-5.3-Flash": {} } })
+    expect((await quota()).windows.map((w) => w.name)).toEqual(["5 hours", "Start Plan / glm-5.3-flash"])
+    _internal.restStart(state, "900")
+    expect(await _internal.preferStart(state, "GLM-5.3-Flash", true)).toBe(false)
+    expect((await quota()).windows.map((w) => w.name)).toEqual(["5 hours", "Start Plan / glm-5.3-flash"])
+    used = 1000
+    const exhausted = await quota()
+    expect(exhausted.windows.at(-1).used).toBe(100)
+    expect(exhausted.windows.at(-1).display).toBe("1000 / 1000")
+  } finally {
+    _internal.startPriority.delete("coding-key\0" + token)
+    _internal.routes.delete("coding-key\0" + token)
+  }
+})
 
 test("a Coding Plan's five hours and week", async () => {
   const reset = Date.now() + 3600_000
