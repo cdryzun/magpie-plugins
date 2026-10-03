@@ -48,7 +48,9 @@ test("a Start allowance remains on the Coding card during cooldown and after exh
   const token = jwt(now + 3600)
   const auth = oauth({ site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", key: "coding-key", jwt: token, plan: "GLM Coding Max" })
   let used = 200
+  let unavailable = false
   serve(({ url }) => {
+    if (unavailable && url.pathname.endsWith("/billing/balance")) throw new Error("temporary network failure")
     if (url.pathname.endsWith("/billing/balance")) return ok({
       server_time: now, plans: [{ status: "active", plan_id: "start-plan", user_plan_id: "p1", ends_at: now + 3600 }],
       balances: [{ plan_id: "start-plan", user_plan_id: "p1", total_units: 1000, used_units: used, expires_at: now + 3600, capabilities: ["model:glm-5.3-flash"] }],
@@ -68,8 +70,13 @@ test("a Start allowance remains on the Coding card during cooldown and after exh
     const exhausted = await quota()
     expect(exhausted.windows.at(-1).used).toBe(100)
     expect(exhausted.windows.at(-1).display).toBe("1000 / 1000")
+    unavailable = true
+    const cached = await quota()
+    expect(cached.windows.at(-1).name).toBe("Start Plan / glm-5.3-flash")
+    expect(cached.windows.at(-1).display).toBe("1000 / 1000")
   } finally {
     _internal.startPriority.delete("coding-key\0" + token)
+    _internal.startReadings.delete("coding-key\0" + token)
     _internal.routes.delete("coding-key\0" + token)
   }
 })

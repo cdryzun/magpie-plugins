@@ -176,6 +176,7 @@ async function onStart(s) {
 
 const flashModel = "glm-5.3-flash"
 const startPriority = new Map()
+const startReadings = new Map()
 
 function startHasFlash(usage, now = Date.now()) {
   const until = Date.parse(usage?.until)
@@ -1371,7 +1372,10 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
           const coding = await codingUsage(s)
           if (startFlashFirst && s.key && s.jwt && !jwtExpired(s.jwt)) {
             // A routing cooldown must not hide the Start Plan's balance.
-            const allowance = await startUsage(s).catch(() => null)
+            const id = s.key + "\0" + s.jwt
+            const current = await startUsage(s).catch(() => null)
+            if (current && !current.error) startReadings.set(id, current)
+            const allowance = current?.error ? null : current ?? startReadings.get(id)
             const others = Object.keys(provider?.models ?? {}).length ? Object.keys(provider.models) : MODELS.map((m) => m.id)
             const codingModels = others.filter((m) => m.toLowerCase() !== flashModel)
             const flash = Date.parse(allowance?.until) > Date.now() && !allowance?.error && Array.isArray(allowance?.windows)
@@ -1412,4 +1416,4 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT, startHasFlash, startRefused, restStart, startPriority, preferStart }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT, startHasFlash, startRefused, restStart, startPriority, startReadings, preferStart }
