@@ -29,9 +29,20 @@ The CLI keeps the sign-in in its home, as `auth.json`. OpenCode (or
 magpie) keeps where that home is, the token and its expiry.
 
 The plugin only reads `auth.json`: the CLI's refresh gives a new token
-each time. When the token is 5 minutes from expiring, or a request is
-refused with 401, the plugin runs `grok models` in that home, so the CLI
-renews it, then reads it again.
+each time. The plugin runs `grok models` in that home, so the CLI renews
+it, then reads it again:
+
+- magpie renews the token 5 minutes before it ends, through the plugin's
+  `auth.refresh`, once for the account and before its requests, models
+  and usage need it. magpie saves what the CLI gave.
+- OpenCode doesn't call that hook: there the token is renewed when it is
+  5 minutes from expiring, before a request.
+- The CLI runs once for a home at a time: a request or renewal that
+  comes while it runs waits for it and reads what it gave. A token the
+  CLI already renewed is taken as it is.
+- When the CLI no longer holds a sign-in in that home (`grok logout`),
+  the account has to be signed in again. When it couldn't renew a token
+  that has ended, magpie tries again later.
 
 ## Requests
 

@@ -1,9 +1,10 @@
 // Refreshing the token: one refresh at a time for an account, the new
 // token saved; only MiniMax's invalid_grant (HTTP 400) signs the account
-// out, any other failure keeps it.
+// out, any other failure keeps it. magpie renews it ahead of time through
+// auth.refresh.
 import "./nonet.mjs"
 import { afterEach, expect, test } from "bun:test"
-import { MiniMaxCodeAuthPlugin } from "./index.mjs"
+import { MiniMaxCodeAuthPlugin, _internal } from "./index.mjs"
 import { fakeMiniMax, json } from "./fake.mjs"
 
 let f
@@ -121,4 +122,106 @@ test("a token MiniMax turns away is refreshed once and the request sent again", 
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
   expect(f.seen.filter((r) => r.path.endsWith("/messages")).length).toBe(2)
   expect(s.auth.access).toBe("new")
+})
+
+// MiniMax spends a refresh token once: the tests below each check the one
+// it was given isn't sent again.
+
+test("magpie renews the sign-in ahead of its end through auth.refresh, once with a request's own refresh", async () => {
+  f = fakeMiniMax()
+  let refreshes = 0
+  f.route("POST /oauth2/token", async () => {
+    refreshes++
+    await Bun.sleep(50)
+    return json({ access_token: "new", refresh_token: "r2", token_type: "Bearer", expires_in: 3600 })
+  })
+  f.route("POST /mavis/api/v1/llm/v1/messages", ok)
+  const s = store({ access: "old", refresh: "r1", expires: Date.now() - 1 })
+  const hooks = await MiniMaxCodeAuthPlugin({ client: s.client })
+  expect(hooks.auth.refreshLead).toBe(10 * 60 * 1000)
+  // magpie's renewal and a request's own check, at once
+  const [got, res] = await Promise.all([hooks.auth.refresh({ ...s.auth }, "minimax-code"), chat(await hooks.auth.loader(s.getAuth))])
+  expect(got).toMatchObject({ access: "new", refresh: "r2" })
+  expect(got.expires).toBeGreaterThan(Date.now() + 3000_000)
+  expect(res.status).toBe(200)
+  expect(refreshes).toBe(1)
+  expect(f.seen.find((r) => r.path === "/oauth2/token").form).toMatchObject({ grant_type: "refresh_token", refresh_token: "r1" })
+  // asked again with the sign-in magpie had before it saved: nothing is spent
+  expect(await hooks.auth.refresh({ type: "oauth", access: "old", refresh: "r1", expires: Date.now() - 1 })).toMatchObject({ access: "new", refresh: "r2" })
+  expect(refreshes).toBe(1)
+  // nothing to renew without a refresh token
+  expect(await hooks.auth.refresh({ type: "oauth", access: "x", expires: Date.now() - 1 })).toBeUndefined()
+})
+
+test("auth.refresh: invalid_grant says the sign-in expired, anything else is passing", async () => {
+  f = fakeMiniMax()
+  let answer = () => json({ error: "invalid_grant" }, 400)
+  f.route("POST /oauth2/token", () => answer())
+  const hooks = await MiniMaxCodeAuthPlugin({ client: {} })
+  const e = await hooks.auth.refresh({ type: "oauth", access: "a", refresh: "r1", expires: Date.now() + 60_000 }).catch((e) => e)
+  expect(e.signIn).toBe("expired")
+  answer = () => json({ error: "server_error" }, 500)
+  const e2 = await hooks.auth.refresh({ type: "oauth", access: "a", refresh: "r9", expires: Date.now() + 60_000 }).catch((e) => e)
+  expect(e2).toBeInstanceOf(Error)
+  expect(e2.signIn).toBeUndefined()
+})
+
+test("a refresh token spent elsewhere, whose new one was saved, doesn't sign the account out", async () => {
+  f = fakeMiniMax()
+  // another process of magpie's renewed r1 to r2 and saved it while this
+  // one read r1: r1 is invalid_grant now
+  const s = store({ access: "old", refresh: "r1", expires: Date.now() - 1 })
+  f.route("POST /oauth2/token", (r) => {
+    if (r.form.refresh_token !== "r1") return json({ error: "unexpected" }, 500)
+    s.auth = { ...s.auth, access: "theirs", refresh: "r2", expires: Date.now() + 3600_000 }
+    return json({ error: "invalid_grant", error_description: "refresh token already used" }, 400)
+  })
+  f.route("POST /mavis/api/v1/llm/v1/messages", ok)
+  const hooks = await MiniMaxCodeAuthPlugin({ client: s.client })
+  const res = await chat(await hooks.auth.loader(s.getAuth))
+  expect(res.status).toBe(200)
+  expect(f.seen.find((r) => r.path.endsWith("/messages")).headers.get("authorization")).toBe("Bearer theirs")
+  expect(f.seen.filter((r) => r.path === "/oauth2/token").length).toBe(1)
+  expect(s.auth.refresh).toBe("r2")
+})
+
+test("a refresh whose save failed keeps its tokens: the spent refresh token isn't sent again", async () => {
+  f = fakeMiniMax()
+  let n = 0
+  f.route("POST /oauth2/token", (r) => {
+    n++
+    return json({ access_token: "new" + n, refresh_token: "r" + (n + 1), token_type: "Bearer", expires_in: n === 1 ? 60 : 3600 })
+  })
+  f.route("POST /mavis/api/v1/llm/v1/messages", ok)
+  const s = store({ access: "old", refresh: "r1", expires: Date.now() - 1 })
+  s.client.auth.set = async () => {
+    throw new Error("disk full")
+  }
+  const hooks = await MiniMaxCodeAuthPlugin({ client: s.client })
+  const opts = await hooks.auth.loader(s.getAuth)
+  expect((await chat(opts)).status).toBe(200)
+  // long after, the store still has r1; the token got (a minute long) is
+  // due: it is r2 that is spent
+  for (const d of _internal.renewed.values()) d.at -= 3600_000
+  expect((await chat(opts)).status).toBe(200)
+  const forms = f.seen.filter((r) => r.path === "/oauth2/token").map((r) => r.form.refresh_token)
+  expect(forms).toEqual(["r1", "r2"])
+  const sent = f.seen.filter((r) => r.path.endsWith("/messages")).map((r) => r.headers.get("authorization"))
+  expect(sent).toEqual(["Bearer new1", "Bearer new2"])
+})
+
+test("a token turned away when a newer one is saved goes again with that one, nothing refreshed", async () => {
+  f = fakeMiniMax()
+  f.route("POST /oauth2/token", () => json({ error: "unexpected" }, 500))
+  const s = store({ access: "old", refresh: "r1", expires: Date.now() + 3600_000 })
+  f.route("POST /mavis/api/v1/llm/v1/messages", (r) => {
+    if (r.headers.get("authorization") === "Bearer newer") return ok()
+    // magpie renewed the sign-in while this request was out
+    s.auth = { ...s.auth, access: "newer", refresh: "r2" }
+    return json({ type: "error", error: { type: "authentication_error", message: "token expired" } }, 401)
+  })
+  const hooks = await MiniMaxCodeAuthPlugin({ client: s.client })
+  const res = await chat(await hooks.auth.loader(s.getAuth))
+  expect(res.status).toBe(200)
+  expect(f.seen.filter((r) => r.path === "/oauth2/token").length).toBe(0)
 })

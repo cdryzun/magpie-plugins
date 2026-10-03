@@ -4,6 +4,11 @@
 # GitHub Actions runs it with no password on each version bump pushed to
 # main (.github/workflows/publish.yml, npm's trusted publishing).
 # One password covers the lot: it is sent with each publish while it lasts.
+# Trusted publishing can't make a package npm has never seen: a new one's
+# first version goes by hand (an npm account of the magpie-community org,
+# `scripts/publish.sh <otp>`), and its Trusted Publisher is set after. Till
+# then Actions passes it by, publishes the rest, and fails at the end
+# naming it.
 set -e
 cd "$(dirname "$0")/.."
 # npm's own registry, whatever ~/.npmrc names (a mirror such as npmmirror
@@ -18,5 +23,14 @@ for dir in packages/*/; do
     echo "= $name@$version is on npm already"
     continue
   fi
+  if [ -n "$GITHUB_ACTIONS" ] && [ -z "$otp" ] && ! npm view "$name" name >/dev/null 2>&1; then
+    echo "::error::$name is not on npm yet: trusted publishing can't create it. Publish its first version by hand (scripts/publish.sh <otp>), then set this workflow as its Trusted Publisher on npmjs.com."
+    new="$new $name"
+    continue
+  fi
   (cd "$dir" && npm publish --access public ${otp:+--otp="$otp"})
 done
+if [ -n "$new" ]; then
+  echo "not published, new to npm:$new"
+  exit 1
+fi

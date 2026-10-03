@@ -15,9 +15,10 @@ const CLIENT_ID = "mcode-public"
 const SCOPE = "agent.default"
 const AUDIENCE = "agent-backend"
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
-const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is refreshed
+const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is refreshed before a request
+const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const SIGN_IN_MS = 10 * 60 * 1000 // when the device code gives no end of its own
-const KEEP_RENEWED_MS = 60 * 1000 // how long a refresh's result answers for the old token
+const KEEP_RENEWED_MS = 60 * 1000 // how long a saved refresh's result answers for the old token
 const SIGN_SECRET = "I*7Cf%WZ#S&%1RlZJ&C2" // MiniMax Code's request signing (x-signature)
 const NPM = "@ai-sdk/anthropic"
 // the key the Anthropic SDK is given in MiniMax Code: a placeholder, the
@@ -520,53 +521,89 @@ async function answer(res, renewed) {
 
 // ---- the plugins ----------------------------------------------------------------
 
+// MiniMax spends a refresh token once: the refresh gives a new one, and
+// the old one asked again is invalid_grant, which signs the account out
+// (MiniMax Code takes a lock across its processes for it). So a refresh
+// token is never sent twice from here.
+//
 // renewing is each refresh under way, by site and the refresh token it
-// spends; renewed is what each just gave, kept a minute so a request that
-// read the old token after the refresh was saved joins it rather than
-// spending the old token again.
+// spends; renewed is what each gave, kept a minute once saved so a request
+// that read the old token after the refresh was saved joins it rather than
+// spending the old token again, and kept for good when the save failed:
+// the account's newest tokens are then here only.
 const renewing = new Map()
 const renewed = new Map()
+
+// latest is the sign-in a with the newest tokens this process got for it.
+function latest(site, a) {
+  for (let i = 0; i < 16 && a.refresh; i++) {
+    const done = renewed.get(site.id + "\n" + a.refresh)
+    if (!done || (done.saved && Date.now() - done.at >= KEEP_RENEWED_MS)) break
+    a = { ...a, ...done.got }
+  }
+  return a
+}
+
+// renew spends a's refresh token, once: those who come while it runs wait
+// for it. save keeps what it gave, saying whether it could.
+function renew(site, a, save) {
+  const key = site.id + "\n" + a.refresh
+  let r = renewing.get(key)
+  if (!r) {
+    r = (async () => {
+      const t = await refreshToken(site, a.refresh)
+      const got = { access: t.access, refresh: t.refresh, expires: t.expires }
+      const done = { got, at: Date.now(), saved: false }
+      renewed.set(key, done)
+      done.saved = await save({ ...a, ...got })
+      done.at = Date.now()
+      return got
+    })().finally(() => renewing.delete(key))
+    renewing.set(key, r)
+  }
+  return r
+}
 
 function makePlugin(site) {
   return async ({ client }) => {
     const save = async (a) => {
+      if (typeof client?.auth?.set !== "function") return false
       try {
-        await client?.auth?.set?.({ path: { id: site.id }, body: a })
-      } catch {}
+        await client.auth.set({ path: { id: site.id }, body: a })
+        return true
+      } catch {
+        return false
+      }
     }
 
     // fresh is the account with an access token that isn't about to end,
-    // refreshed (and saved) when it is, or when force is set (MiniMax
-    // turned the token away). One refresh at a time for an account: those
-    // who come meanwhile wait for it. renewed says this call refreshed.
-    const fresh = async (getAuth, force = false) => {
-      const a = await getAuth()
-      if (a?.type !== "oauth" || !a.access) throw new Error(`${site.name} isn't signed in`)
-      if (!force && !(a.expires && Date.now() >= a.expires - EARLY_MS)) return { a, renewed: false }
+    // refreshed (and saved) when it is, or when MiniMax turned away the
+    // access token rejected and no newer one is had. renewed says the
+    // token isn't the one getAuth read: this call or another refreshed it.
+    const fresh = async (getAuth, rejected, again = false) => {
+      const stored = await getAuth()
+      if (stored?.type !== "oauth" || !stored.access) throw new Error(`${site.name} isn't signed in`)
+      const a = latest(site, stored)
+      const newer = a.access !== stored.access
+      if (rejected !== undefined && a.access !== rejected) return { a, renewed: true }
+      const force = rejected !== undefined
+      if (!force && !(a.expires && Date.now() >= a.expires - EARLY_MS)) return { a, renewed: newer }
       if (!a.refresh) {
-        if (Date.now() < a.expires) return { a, renewed: false }
+        if (Date.now() < a.expires) return { a, renewed: newer }
         throw new SignInExpired(site)
       }
-      const key = site.id + "\n" + a.refresh
-      const done = renewed.get(key)
-      if (done && Date.now() - done.at < KEEP_RENEWED_MS) return { a: { ...a, ...done.got }, renewed: true }
-      let r = renewing.get(key)
-      if (!r) {
-        r = (async () => {
-          const t = await refreshToken(site, a.refresh)
-          const got = { access: t.access, refresh: t.refresh, expires: t.expires }
-          await save({ ...a, ...got })
-          renewed.set(key, { got, at: Date.now() })
-          return got
-        })().finally(() => renewing.delete(key))
-        renewing.set(key, r)
-      }
       try {
-        return { a: { ...a, ...(await r) }, renewed: true }
+        return { a: { ...a, ...(await renew(site, a, save)) }, renewed: true }
       } catch (e) {
-        if (signedOut(e)) throw new SignInExpired(site)
+        if (signedOut(e)) {
+          // spent by someone else (magpie's renewal, another process of
+          // magpie's), who saved the new one: that one is used
+          const now = again ? undefined : await getAuth().catch(() => undefined)
+          if (now?.type === "oauth" && now.refresh && now.refresh !== a.refresh && now.refresh !== stored.refresh) return fresh(getAuth, rejected, true)
+          throw new SignInExpired(site)
+        }
         // passing: the token in hand may still do
-        if (!force && Date.now() < a.expires) return { a, renewed: false }
+        if (!force && Date.now() < a.expires) return { a, renewed: newer }
         throw Object.assign(new Error(`${site.name} token refresh: ${e?.message ?? e}`), { signIn: "kept" })
       }
     }
@@ -608,6 +645,24 @@ function makePlugin(site) {
       },
       auth: {
         provider: site.id,
+        // magpie renews the sign-in LEAD_MS before its end, once for the
+        // account, before its requests, models and usage ask for it; the
+        // check before each request below stays for OpenCode, which
+        // doesn't call this
+        refreshLead: LEAD_MS,
+        async refresh(auth) {
+          if (auth?.type !== "oauth" || !auth.access || !auth.refresh) return undefined
+          const a = latest(site, auth)
+          // renewed here already, the store not yet saying so
+          if (a.access !== auth.access && Date.now() < a.expires - LEAD_MS) return { access: a.access, refresh: a.refresh, expires: a.expires }
+          try {
+            // magpie saves what this gives
+            return await renew(site, a, async () => true)
+          } catch (e) {
+            if (signedOut(e)) throw new SignInExpired(site)
+            throw e
+          }
+        },
         async loader(getAuth) {
           const auth = await getAuth()
           if (auth?.type !== "oauth") return {}
@@ -633,8 +688,9 @@ function makePlugin(site) {
               let { a, renewed: did } = await fresh(getAuth)
               let res = await send(a)
               if (res.status === 401) {
-                // the token was turned away before its end: refresh once
-                ;({ a } = await fresh(getAuth, true))
+                // the token was turned away before its end: a newer one
+                // if there is one, else refreshed, and sent once more
+                ;({ a } = await fresh(getAuth, a.access))
                 did = true
                 res = await send(a)
               }

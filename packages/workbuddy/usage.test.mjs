@@ -50,7 +50,7 @@ const usageOf = async (plugin, auth, client = {}) => (await plugin({ client })).
 test("a paid WorkBuddy account's credits", async () => {
   const calls = serve({ "/billing/meter/get-user-resource-summary": () => ok(PAID) })
   const auth = { type: "oauth", access: "two-access", refresh: "r", expires: later(), uid: "u2", domain: "" }
-  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ signIn: "kept", plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000" }] })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ signIn: "kept", plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000", amount: 2500, limit: 10000, unit: "credits" }] })
   const c = calls[0]
   expect(c.url.origin).toBe("https://copilot.tencent.com")
   expect(c.init.method).toBe("POST")
@@ -64,14 +64,14 @@ test("a free WorkBuddy AI account, at its own site and domain", async () => {
   const calls = serve({ "/billing/meter/get-user-resource-summary": () =>
     ok({ IsPaidUser: false, Packages: [{ CycleTotalCapacity: "1000", CycleUsedCapacity: "100" }] }) })
   const auth = { type: "oauth", access: "ai-access", expires: later(), uid: "ai2", domain: "www.codebuddy.ai" }
-  expect(await usageOf(WorkBuddyAIAuthPlugin, auth)).toEqual({ signIn: "kept", plan: "Free", windows: [{ name: "Credits", used: 10, display: "100 / 1000" }] })
+  expect(await usageOf(WorkBuddyAIAuthPlugin, auth)).toEqual({ signIn: "kept", plan: "Free", windows: [{ name: "Credits", used: 10, display: "100 / 1000", amount: 100, limit: 1000, unit: "credits" }] })
   expect(calls[0].url.origin).toBe("https://www.workbuddy.ai")
   expect(calls[0].headers.get("x-domain")).toBe("www.codebuddy.ai")
 })
 
 test("counts and plans as Go says them", () => {
   expect(_internal.usageOf({ IsPaidUser: true, Packages: [{ CycleTotalCapacity: 3300, CycleUsedCapacity: "438.88000002" }, {}] }, "Team"))
-    .toEqual({ plan: "Team", windows: [{ name: "Credits", used: (100 * 438.88000002) / 3300, display: "438.88 / 3300" }] })
+    .toEqual({ plan: "Team", windows: [{ name: "Credits", used: (100 * 438.88000002) / 3300, display: "438.88 / 3300", amount: 438.88000002, limit: 3300, unit: "credits" }] })
   // no capacity, no window
   expect(_internal.usageOf({ IsPaidUser: false, Packages: [{ CycleTotalCapacity: "", CycleUsedCapacity: null }] }, ""))
     .toEqual({ plan: "Free", windows: [] })
@@ -132,7 +132,7 @@ test("the desktop's sign-in is renewed in memory only", async () => {
   })
   const auth = { type: "oauth", access: "", refresh: "", expires: 0, source: "desktop", uid: "u1" }
   const client = { auth: { set: async (x) => sets.push(x) } }
-  expect(await usageOf(WorkBuddyAuthPlugin, auth, client)).toEqual({ signIn: "kept", plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000" }] })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth, client)).toEqual({ signIn: "kept", plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000", amount: 2500, limit: 10000, unit: "credits" }] })
   expect(calls[1].headers.get("authorization")).toBe("Bearer desk-new")
   expect(calls[1].headers.get("x-domain")).toBe("www.codebuddy.cn")
   expect(sets).toEqual([]) // never saved,

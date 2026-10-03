@@ -26,10 +26,21 @@ What is kept: the job token, its refresh token and expiry, the uid, the
 device token and a machine id made for this sign-in. OpenCode keeps them in
 `auth.json`; magpie keeps them in `plugin-auth.json`.
 
-The job token is refreshed 5 minutes before it runs out. Qoder spends a
-refresh token once, so the new pair is saved straight away, and refreshes
-never run at the same time. When Qoder refuses a refresh (401 or 403), the
-request says to sign in again.
+Refreshing:
+- Qoder spends a refresh token once, so the plugin never sends one twice.
+- magpie renews the job token 10 minutes before it runs out, through the
+  plugin's `auth.refresh`, once for the account and before its requests,
+  models and usage need it; magpie saves the new pair. OpenCode doesn't
+  call that hook: there the job token is refreshed 5 minutes before it runs
+  out, before a request, and the new pair is saved straight away.
+- Only one refresh runs at a time. A request that reads the sign-in before
+  magpie saved a renewal uses the renewed pair, and a renewal handed a pair
+  a request already spent gives what that request got.
+- The device token, which reads usage, has no end on record: it is rotated
+  when Qoder refuses it. On a [Qoder CN](#qoder-cn) device-token account it
+  is the chat token too, and is renewed as above.
+- When Qoder refuses a refresh (401 or 403), the account needs signing in
+  again. Any other failure is tried again later.
 
 ## Requests
 

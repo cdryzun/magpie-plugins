@@ -21,7 +21,8 @@ const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 // signed-in one rides as "workos:<jwt>" (Cline's own clients send it so)
 const WORKOS_PREFIX = "workos:"
 
-const REFRESH_LEAD = 5 * 60 * 1000
+const REFRESH_LEAD = 5 * 60 * 1000 // a token this close to its end is refreshed before a request
+const RENEW_LEAD = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 // a refresh that failed transiently keeps a token with this much left, as
 // Cline's getValidClineCredentials does (DEFAULT_RETRYABLE_TOKEN_GRACE_MS);
 // only once it has actually expired is the sign-in the one to blame
@@ -692,6 +693,20 @@ export const ClinePlugin = async ({ client } = {}) => {
 		return run
 	}
 
+	// spend trades r's refresh token for a new pair and holds it, whatever a
+	// save then does, against the token it spent and the one getAuth handed
+	// back (a's): the next request offering either of them finds this chain's
+	// newest. Called under the lock only.
+	const spend = async (a, r) => {
+		const p = await refresh(r)
+		const next = { ...r, access: p.access, refresh: p.refresh, expires: p.expires, uid: p.uid || r.uid, email: p.email || r.email, name: p.name || r.name, accountId: r.accountId || p.accountId }
+		const chain = held.get(a.refresh) ?? {}
+		Object.assign(chain, { access: next.access, refresh: next.refresh, expires: next.expires })
+		held.set(a.refresh, chain)
+		held.set(r.refresh, chain)
+		return next
+	}
+
 	// fresh is the account with a token still good: one near its end is
 	// renewed, and the rotated pair saved back. A transient refresh failure
 	// keeps the token that is still good, as Cline's own client does; only a
@@ -711,23 +726,15 @@ export const ClinePlugin = async ({ client } = {}) => {
 			const r = h ? { ...a, access: h.access, refresh: h.refresh, expires: h.expires } : a
 			if (r.access && r.expires - Date.now() > REFRESH_LEAD) return { ...r, bearer: bearerOf(r), renewed: false }
 			if (!r.refresh) throw new Lapsed("Cline's access token has expired and there is no refresh token; sign in to Cline again")
-			let p
+			let next
 			try {
-				p = await refresh(r)
+				next = await spend(a, r)
 			} catch (e) {
 				// a token that is still good rides on through a refresh that
 				// failed for a while; an expired one is the sign-in gone
 				if (!e?.expired && r.access && r.expires - Date.now() > RETRYABLE_GRACE) return { ...r, bearer: bearerOf(r), renewed: false }
 				throw e
 			}
-			const next = { ...r, access: p.access, refresh: p.refresh, expires: p.expires, uid: p.uid || r.uid, email: p.email || r.email, name: p.name || r.name, accountId: r.accountId || p.accountId }
-			// the pair just rotated, held whatever the save through magpie does,
-			// against the token it spent and the one getAuth handed back: the
-			// next request offering either of them finds this chain's newest
-			const chain = held.get(a.refresh) ?? {}
-			Object.assign(chain, { access: next.access, refresh: next.refresh, expires: next.expires })
-			held.set(a.refresh, chain)
-			held.set(r.refresh, chain)
 			await remember(next)
 			const cred = { ...next, bearer: bearerOf(next), renewed: true }
 			renewals.add(cred)
@@ -781,6 +788,38 @@ export const ClinePlugin = async ({ client } = {}) => {
 
 		auth: {
 			provider: PROVIDER,
+
+			// magpie renews the sign-in RENEW_LEAD before its end, once for the
+			// account, before its requests, models and usage ask for it; the
+			// check in fresh before each request stays for OpenCode, which
+			// doesn't call this. It takes the same lock and the same held pairs
+			// as fresh, so the two never spend one refresh token twice. magpie
+			// saves what this gives (it is merged over the sign-in): only what
+			// changed comes back, and remember isn't called here.
+			refreshLead: RENEW_LEAD,
+			refresh: (auth) =>
+				locked(async () => {
+					const a = authOf(auth)
+					// an API key, or a sign-in with nothing to renew with
+					if (auth?.type !== "oauth" || !a.refresh) return undefined
+					// renewed here already (a request's refresh), the store not
+					// yet saying so: that pair, not another spend
+					const h = held.get(a.refresh)
+					const r = h ? { ...a, access: h.access, refresh: h.refresh, expires: h.expires } : a
+					if (h && r.access && r.expires - Date.now() > RENEW_LEAD) return { access: r.access, refresh: r.refresh, expires: r.expires }
+					let next
+					try {
+						next = await spend(a, r)
+					} catch (e) {
+						// a refused refresh is the sign-in gone; anything else is
+						// retried by magpie, the token in hand riding on meanwhile
+						if (e?.expired) throw Object.assign(new Error(String(e.message ?? e).replace(/^Cline: /, "")), { signIn: "expired" })
+						throw e
+					}
+					const out = { access: next.access, refresh: next.refresh, expires: next.expires }
+					for (const k of ["uid", "email", "name", "accountId"]) if (next[k] && next[k] !== a[k]) out[k] = next[k]
+					return out
+				}),
 
 			async loader(getAuth) {
 				const a = await getAuth()

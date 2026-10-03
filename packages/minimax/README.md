@@ -42,10 +42,22 @@ Each account signs in on its own, so magpie can hold several and switch
 between them.
 
 Refreshing:
-- The access token is refreshed two minutes before it ends, or when MiniMax
-  turns it away (HTTP 401). The new token is saved.
+- MiniMax spends a refresh token once. Sent a second time it is
+  `invalid_grant`, which signs the account out, so the plugin never sends
+  one twice.
+- magpie renews the token ten minutes before it ends, through the plugin's
+  `auth.refresh`, once for the account and before its requests, models and
+  usage need it. OpenCode doesn't call that hook: there the access token is
+  refreshed two minutes before it ends, before a request. Either way the
+  new token is saved.
+- When MiniMax turns the token away (HTTP 401), the request goes again with
+  a newer token if one was saved meanwhile, else after a refresh.
 - Only one refresh runs at a time for an account. Requests that arrive
-  meanwhile wait for it and use its token.
+  meanwhile wait for it and use its token. When saving the new token
+  fails, the plugin keeps it in memory and goes on with it, rather than
+  with the spent one on disk.
+- A refresh token someone else spent first (another magpie process) isn't a
+  sign-out when the new one they saved is there: that one is used.
 - The account counts as signed out only when MiniMax answers the refresh
   with `invalid_grant` (HTTP 400). Any other failure keeps the sign-in, and
   the current token is used while it lasts.

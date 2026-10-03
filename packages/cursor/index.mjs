@@ -1164,6 +1164,59 @@ function usageOf(uf) {
   return { input: Math.max(inp - cr - cw, 0), output: pbNum(uf, 2), cacheRead: cr, cacheWrite: cw, reasoning: pbNum(uf, 5) }
 }
 
+// A step that calls the caller's tools has no TurnEndedUpdate: Cursor ends
+// the turn, and tells what it used, only once the client has run the tools
+// and sent their results in the same Run, and the caller runs them after
+// the Run is closed (magpie #676). Before that it sends nothing more than
+// the conversation's checkpoint and heartbeats, and a cancelled Run ends
+// with an error and no usage either. The dashboard's usage events count
+// every Run, by its conversation_id, the uncached input apart from what
+// was read from the cache and written to it, as TurnEndedUpdate does; one
+// shows about 2.5 s after the Run is closed. STEP_WAIT is how long a step's
+// is looked for: first after that long, then every so often until the
+// end, after which it is guessed as before.
+const STEP_WAIT = { first: 1500, every: 500, until: 6000 }
+
+// claimed are the usage events already counted, by conversation and time,
+// so that two steps of one conversation never count the same one.
+const claimed = new Map()
+
+// stepUsage is the usage of the Run of conversation conv started at since,
+// as the dashboard's usage events count it; null when none shows in time.
+async function stepUsage(tok, conv, since, signal) {
+  const end = Date.now() + STEP_WAIT.until
+  const wait = (ms) => new Promise((r) => {
+    const t = setTimeout(r, ms)
+    signal?.addEventListener("abort", () => (clearTimeout(t), r()), { once: true })
+  })
+  for (const [k, at] of claimed) if (Date.now() - at > 600_000) claimed.delete(k)
+  await wait(STEP_WAIT.first)
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
+  while (!signal?.aborted) {
+    try {
+      const res = await fetch(API + "/aiserver.v1.DashboardService/GetFilteredUsageEvents", {
+        method: "POST",
+        headers: await headersFor(tok),
+        body: JSON.stringify({ teamId: 0, startDate: String(since - 60_000), endDate: String(Date.now() + 60_000), page: 1, pageSize: 50 }),
+        signal: AbortSignal.timeout(5000),
+      })
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) return null // not this account's to read
+      const evs = res.ok ? ((await res.json())?.usageEventsDisplay ?? []) : []
+      const ev = evs
+        .filter((e) => e?.conversationId === conv && e.tokenUsage && num(e.timestamp) >= since - 1000 && !claimed.has(conv + "\0" + e.timestamp))
+        .sort((a, b) => num(a.timestamp) - num(b.timestamp))[0]
+      if (ev) {
+        claimed.set(conv + "\0" + ev.timestamp, Date.now())
+        const t = ev.tokenUsage
+        return { input: num(t.inputTokens), output: num(t.outputTokens), cacheRead: num(t.cacheReadTokens), cacheWrite: num(t.cacheWriteTokens), reasoning: 0 }
+      }
+    } catch {}
+    if (Date.now() + STEP_WAIT.every > end) return null
+    await wait(STEP_WAIT.every)
+  }
+  return null
+}
+
 // buildRun is the Run's first message, an AgentClientMessage with its
 // run_request, and the blobs it names. The conversation state is the
 // messages and one turn, which the server wants there to sample at all.
@@ -1275,7 +1328,11 @@ function open(base, headers, signal) {
 // runOnce is one Run of the chat on the agent API at base: an async
 // iterator of the answer's pieces, or the error it failed with before any.
 async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params }) {
-  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, convID, { maxMode, params })
+  // the Run's conversation_id, a new one when nothing names the session:
+  // its usage event is found by it
+  const cid = convID || randomUUID()
+  const since = Date.now()
+  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, cid, { maxMode, params })
   const o = await open(
     base,
     {
@@ -1318,7 +1375,14 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
     close()
     return { error: failure(o.status, Buffer.concat(chunks).toString("utf8").slice(0, 1 << 20)) }
   }
-  const it = decode(frames(req), { send, blobs, tools, estimate: conv.estimate })
+  const it = decode(frames(req), {
+    send,
+    blobs,
+    tools,
+    estimate: conv.estimate,
+    close,
+    stepUsage: () => stepUsage(tok, cid, since, signal),
+  })
   const wrapped = (async function* () {
     try {
       yield* it
@@ -1344,8 +1408,10 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
 
 // decode follows the server's messages into the answer's pieces until the
 // turn ends, or the model has made its tool calls.
-async function* decode(stream, { send, blobs, tools, estimate }) {
+async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage }) {
   let calls = 0
+  // ended: Cursor said what the turn used
+  let ended = false
   let listed = 0
   let said = 0
   // wrote: the reply's text alone; a turn of thinking only says nothing
@@ -1368,6 +1434,16 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
       },
     }
   }
+  // settled is finish once a step that called tools has its usage: the
+  // dashboard's count, the Run closed first, when the turn didn't end
+  const settled = async () => {
+    if (calls > 0 && !ended && stepUsage) {
+      close?.()
+      const u = await stepUsage().catch(() => null)
+      if (u) usage = u
+    }
+    return finish()
+  }
   const closeExec = (id) => send(pb().bytes(5, pb().bytes(1, pb().varint(1, id))).done())
   try {
     for await (const f of stream) {
@@ -1375,7 +1451,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
         const e = failure(200, f.data)
         if (e.status < 200 || e.status > 299) yield { error: e }
         else if (wrote === 0 && calls === 0) yield { error: { status: 502, message: "an empty reply" } }
-        else yield finish()
+        else yield await settled()
         return
       }
       for (const m of fields(f.data)) {
@@ -1405,6 +1481,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
                 }
                 case 14: // turn ended, with what it used
                   usage = usageOf(uf)
+                  ended = true
                   if (calls === 0) {
                     // nothing written and nothing called: an empty reply,
                     // which the client asks again, not a finished turn
@@ -1415,7 +1492,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
                 case 27: // how many tool calls the step makes, sent before them
                   listed = pbNum(uf, 1)
                   if (listed > 0 && calls >= listed) {
-                    yield finish()
+                    yield await settled()
                     return
                   }
                   break
@@ -1431,7 +1508,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
             }
             if (listed > 0 && calls >= listed) {
               // every call made: the caller runs them
-              yield finish()
+              yield await settled()
               return
             }
             break
@@ -1457,13 +1534,13 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
       }
     }
     if (calls > 0) {
-      yield finish()
+      yield await settled()
       return
     }
     yield { error: { status: 502, message: "the reply broke off: EOF" } }
   } catch (e) {
     if (calls > 0 && /EOF/.test(e?.message ?? "")) {
-      yield finish()
+      yield await settled()
       return
     }
     yield { error: { status: 502, message: "the reply broke off: " + (e?.message ?? e) } }
@@ -1733,4 +1810,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { STEP_WAIT, stepUsage, catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

@@ -18,6 +18,7 @@ const APP_VERSION = "26.929.292248"
 const SOURCE = "mimocode-cli-free"
 const UA = "miNative PC/Normal Windows_NT/10.0.26100 SDKV/1.0.0 DEVT/PC DEVS/Windows APP/miaccount_desktop APPV/0.1.0"
 const RENEW_AFTER = 24 * 60 * 60 * 1000 // the app signs on again after a day
+const LEAD_MS = 10 * 60 * 1000 // this close to it, magpie signs on again ahead of time (auth.refresh)
 const SIGN_IN_LIFE = 10 * 60 * 1000
 
 const MODEL = { release_date: "2026-07-01", attachment: true, tool_call: true, limit: { context: 1_000_000, output: 128_000 }, modalities: { input: ["text", "image"], output: ["text"] } }
@@ -338,13 +339,38 @@ function serverTime(v) {
 
 export const MimoAuthPlugin = async ({ client }) => {
   // renewals under way, one to an account: two accounts signing on at
-  // once each keep their own session
+  // once each keep their own session. renewed is the last session each
+  // account got here, so magpie's auth.refresh handed a sign-in from
+  // before it gives that one rather than signing on again.
   const renewing = new Map()
+  const renewed = new Map()
 
   const save = async (auth) => {
     try {
       await client?.auth?.set?.({ path: { id: ID }, body: auth })
     } catch {}
+  }
+
+  // renew signs the account on again, once at a time: those who come
+  // while it runs wait for it. keep saves the new session (the request
+  // path); magpie's auth.refresh saves what it gives itself.
+  const renew = (a, keep) => {
+    const who = String(a.creds.userId ?? "")
+    let r = renewing.get(who)
+    if (!r) {
+      r = (async () => {
+        const s = await session(a.creds, a.creds.base)
+        const issued = Date.now()
+        const got = { creds: a.creds, cookies: s.cookies, expires: issued + RENEW_AFTER, renewed: true }
+        renewed.set(who, got)
+        if (keep) await save(toAuth(a.creds, s.cookies, issued))
+        return got
+      })().finally(() => {
+        renewing.delete(who)
+      })
+      renewing.set(who, r)
+    }
+    return r
   }
 
   // fresh is the account with a live session, signed on again when it is
@@ -355,26 +381,34 @@ export const MimoAuthPlugin = async ({ client }) => {
     const a = fromAuth(await getAuth())
     if (!a) throw new Error("Xiaomi MiMo: not signed in")
     if (!force && Object.keys(a.cookies).length && Date.now() < a.expires) return a
-    const who = String(a.creds.userId ?? "")
-    let r = renewing.get(who)
-    if (!r) {
-      r = (async () => {
-        try {
-          const s = await session(a.creds, a.creds.base)
-          const issued = Date.now()
-          await save(toAuth(a.creds, s.cookies, issued))
-          return { creds: a.creds, cookies: s.cookies, expires: issued + RENEW_AFTER, renewed: true }
-        } catch (e) {
-          // a hiccup: the session in hand may still do
-          if (!(e instanceof Lapsed) && !force && Object.keys(a.cookies).length) return a
-          throw e
-        }
-      })().finally(() => {
-        renewing.delete(who)
-      })
-      renewing.set(who, r)
+    try {
+      return await renew(a, true)
+    } catch (e) {
+      // a hiccup: the session in hand may still do
+      if (!(e instanceof Lapsed) && !force && Object.keys(a.cookies).length) return a
+      throw e
     }
-    return r
+  }
+
+  // refresh is magpie's auth.refresh: the session signed on again
+  // LEAD_MS before the app would, as the fields that changed (the Xiaomi
+  // account in refresh stays as it is). A passToken Xiaomi no longer takes
+  // is signIn "expired"; any other failure throws as it is.
+  const refresh = async (auth) => {
+    const a = fromAuth(auth)
+    if (!a) return undefined
+    const last = renewed.get(String(a.creds.userId ?? ""))
+    // signed on again here already, the store not yet saying so
+    if (last && last.expires > a.expires && Date.now() < last.expires - LEAD_MS) {
+      return { access: JSON.stringify(last.cookies), expires: last.expires }
+    }
+    try {
+      const s = await renew(a, false)
+      return { access: JSON.stringify(s.cookies), expires: s.expires }
+    } catch (e) {
+      if (e instanceof Lapsed) throw Object.assign(new Error(e.message), { signIn: "expired" })
+      throw e
+    }
   }
 
   // page asks the MiMo server for one of the account's pages, signing on
@@ -472,6 +506,11 @@ export const MimoAuthPlugin = async ({ client }) => {
     auth: {
       provider: ID,
       usage,
+      // magpie signs the account on again LEAD_MS before the day is out,
+      // once, before its requests, models and usage ask; fresh's check
+      // before each request stays for OpenCode, which doesn't call this
+      refreshLead: LEAD_MS,
+      refresh,
       loader: async (getAuth) => {
         const a = fromAuth(await getAuth())
         if (!a) return {}

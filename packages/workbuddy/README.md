@@ -33,6 +33,16 @@ marker, `{"type": "oauth", "source": "desktop", "accountId", "uid"}`. OpenCode k
 refreshed a minute before it ends, and the new one is saved. If the refresh
 fails, the old token is used while it lasts.
 
+In magpie (0.1.684 or later) the plugin also gives `auth.refresh` with
+`refreshLead` of 5 minutes: magpie renews a browser sign-in (an hour's
+token) 5 minutes before it ends, once for the account, before its
+requests, models and usage ask, and saves what it gives. It goes through
+the same one-refresh-at-a-time as a request's refresh, so a refresh token
+is never spent twice. A failed renewal, a refresh token past its end
+included, doesn't mark the account, as the built-in never did; magpie
+tries again later, and the old token is used meanwhile.
+OpenCode doesn't call `auth.refresh`; the check before each request stays.
+
 Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
 built-in WorkBuddy does.

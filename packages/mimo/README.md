@@ -29,7 +29,13 @@ Chat completions go to `https://mimo-server-<region>.xiaomimimo.com/api/route/ch
 
 `mimo-auto`, the app's default model, is requested as `mimo-pro`.
 
-The session is renewed with the passToken a day after it was issued. A model
+The session is renewed with the passToken a day after it was issued.
+magpie (0.1.684 and later) does it ahead of time through `auth.refresh`, ten
+minutes before that day is out (`refreshLead`), once for the account and
+before its requests, models and usage ask for it; a passToken Xiaomi no
+longer takes marks the account for a new sign-in. The check before each
+request stays for OpenCode, which doesn't call `auth.refresh`, and one
+sign-on at a time serves both. A model
 request the server turns away (a 401) is answered as the server answered it,
 as magpie's built-in MiMo account did; reading usage renews the session once
 when the server turns it away. If the passToken no longer works, sign in
