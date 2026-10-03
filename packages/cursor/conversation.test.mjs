@@ -173,3 +173,37 @@ test("usage takes the cache out of input_tokens, and keeps reasoning", async () 
   expect(usage.prompt_tokens).toBeGreaterThan(90)
   expect(usage.prompt_tokens_details).toEqual({ cached_tokens: 0, cache_write_tokens: 0 })
 })
+
+// GLM-5.3 called the catalog's <tool name=...> entries bare, as tools of
+// their own (#11): each entry is the CallDynamicTool call itself
+test("the tool catalog writes each tool as its CallDynamicTool call", () => {
+  const tools = [
+    { name: "Read", description: "read a file", schemaText: '{"type":"object"}' },
+    { name: "Bash", description: "run a command", schemaText: '{"type":"object"}' },
+  ]
+  const s = _internal.catalog(tools)
+  expect(s).not.toContain("<tool name=")
+  for (const t of tools) {
+    expect(s).toContain(`<call>CallDynamicTool({"namespace":"magpie","toolName":"${t.name}","arguments":{...}})\n${t.description}\narguments schema: ${t.schemaText}\n</call>`)
+  }
+  expect(_internal.catalog([])).toBe("")
+})
+
+// a turn of thinking only is an empty reply, which the client asks again
+test("a turn that ends with thinking only is an empty reply", async () => {
+  const update = (num, body) => ({ data: pb().bytes(1, pb().bytes(num, body)).done() })
+  const run = async (...frames) => {
+    const out = []
+    for await (const p of _internal.decode(frames, { send() {}, blobs: new Map(), tools: [], estimate: 1 })) out.push(p)
+    return out
+  }
+  const empty = { error: { status: 502, message: "an empty reply" } }
+  const thinking = update(4, pb().str(1, "hmm").done())
+  const ended = update(14, pb().varint(2, 3).done())
+  expect(await run(thinking, ended)).toEqual([{ reasoning: "hmm" }, empty])
+  // and so at the stream's end
+  expect(await run(thinking, { end: true, data: Buffer.from("{}") })).toEqual([{ reasoning: "hmm" }, empty])
+  // with text it finishes
+  const out = await run(thinking, update(1, pb().str(1, "hi").done()), ended)
+  expect(out.at(-1).stop).toBe("stop")
+})

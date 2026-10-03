@@ -981,11 +981,14 @@ function toolsOf(chat) {
 // catalog lists the caller's tools for the model. It sees MCP tools only
 // through Cursor's GetDynamicTools and CallDynamicTool, and Cursor names
 // them in a prompt of its own, which this conversation goes without:
-// without the list the model says it has no such tool.
+// without the list the model says it has no such tool. Each entry is
+// written as the CallDynamicTool call itself: listed as <tool name=...>,
+// some models (GLM-5.3) called the names bare, as tools of their own, and
+// those calls went nowhere (#11).
 function catalog(tools) {
   if (!tools.length) return ""
-  let s = `\n\n<dynamic_tool_catalog>\nThe tools below are available in the MCP namespace "magpie". Call one with \`${CALL}\` (namespace "magpie", toolName, arguments). Their schemas are given here, so there is no need to call \`GetDynamicTools\` first.\n`
-  for (const t of tools) s += `<tool name="${t.name}">\n${t.description}\ninput schema: ${t.schemaText}\n</tool>\n`
+  let s = `\n\n<dynamic_tool_catalog>\nThe MCP namespace "magpie" has the tools below. They are reached only through \`${CALL}\`, never as tools of their own. Each entry is the exact call to make; its arguments must match the schema given. The schemas are complete, so there is no need to call \`GetDynamicTools\` first.\n`
+  for (const t of tools) s += `<call>${CALL}({"namespace":"magpie","toolName":"${t.name}","arguments":{...}})\n${t.description}\narguments schema: ${t.schemaText}\n</call>\n`
   return s + "</dynamic_tool_catalog>"
 }
 
@@ -1345,6 +1348,8 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
   let calls = 0
   let listed = 0
   let said = 0
+  // wrote: the reply's text alone; a turn of thinking only says nothing
+  let wrote = 0
   let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
   const finish = () => {
     if (!usage.output) usage.output = Math.floor((said + 3) / 4)
@@ -1369,7 +1374,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
       if (f.end) {
         const e = failure(200, f.data)
         if (e.status < 200 || e.status > 299) yield { error: e }
-        else if (said === 0 && calls === 0) yield { error: { status: 502, message: "an empty reply" } }
+        else if (wrote === 0 && calls === 0) yield { error: { status: 502, message: "an empty reply" } }
         else yield finish()
         return
       }
@@ -1384,6 +1389,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
                   const t = pbStr(uf, 1)
                   if (t) {
                     said += t.length
+                    wrote += t.length
                     yield { text: t }
                   }
                   break
@@ -1400,7 +1406,9 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
                 case 14: // turn ended, with what it used
                   usage = usageOf(uf)
                   if (calls === 0) {
-                    yield finish()
+                    // nothing written and nothing called: an empty reply,
+                    // which the client asks again, not a finished turn
+                    yield wrote === 0 ? { error: { status: 502, message: "an empty reply" } } : finish()
                     return
                   }
                   break
@@ -1725,4 +1733,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
