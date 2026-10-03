@@ -4,6 +4,7 @@
 // built-in Factory account (internal/provider/factory*.go).
 
 import { STATUS_CODES } from "node:http"
+import { parseToolJSON, wrapAnthropicTools, unwrapAnthropicTools } from "./anthropic-tools.mjs"
 
 const PROVIDER = "factory"
 
@@ -16,6 +17,10 @@ const CLIENT_ID = "client_01HNM792M5G5G1A2THWPXKFMXB"
 const VERSION = "0.231.0"
 // how long before an access token lapses it is renewed (droid: a minute)
 const REFRESH_LEAD = 2 * 60 * 1000
+// and how long before, magpie renews it ahead of time (auth.refresh): a
+// minute more, so under magpie the check before a request finds it fresh.
+// WorkOS's access tokens are short-lived, so not much more
+const MAGPIE_LEAD = 3 * 60 * 1000
 // how long an account whose whoami failed waits before asking again
 const ASK_AGAIN = 10 * 60 * 1000
 
@@ -600,7 +605,20 @@ const SYSTEM_MODEL_CONTEXT = /(^|\n\n)You are powered by the model (?:named )?[^
 const SYSTEM_MODEL_UPDATE = /^You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/
 const SYSTEM_ENV_UPDATE = /^# Environment update\n(?: {1,2}- [^\n]*\n)+(?=\n|$)/
 const SYSTEM_TOKEN_CONTEXT = /(?:^|\n\n)<total_tokens>\d+ tokens left<\/total_tokens>(?=\n\n|$)/
+// A SessionStart hook's output comes ahead of the generated context in the
+// same message (Claude Code 2.1.288 with a hook installed, #634): the
+// context after it is adapted as it would be on its own, the hook's output
+// is left as it is.
+const HOOK_OUTPUT = /^SessionStart:[^\n]* hook success:/
+const HOOK_CONTEXT = "\n# Environment\nYou have been invoked in the following environment:"
 function systemContext(text) {
+  if (HOOK_OUTPUT.test(text)) {
+    const at = text.indexOf(HOOK_CONTEXT)
+    return at < 0 ? text : text.slice(0, at + 1) + generatedContext(text.slice(at + 1))
+  }
+  return generatedContext(text)
+}
+function generatedContext(text) {
   const environment = SYSTEM_ENV_CONTEXT.test(text)
   if (!environment && !((SYSTEM_MODEL_UPDATE.test(text) || SYSTEM_ENV_UPDATE.test(text)) && SYSTEM_TOKEN_CONTEXT.test(text))) return text
   let out = text.replace(SYSTEM_MODEL_CONTEXT, (paragraph) => paragraph
@@ -619,6 +637,22 @@ function systemContext(text) {
   }
   return out
 }
+
+// The model line inside a system prompt (Claude Desktop's, #634) is the
+// same generated sentence as in a reminder; only that line changes.
+const SYSTEM_MODEL_LINE = /(^|\n)You are powered by the model [^\n<>]+/g
+function systemModelLine(text) {
+  return text.replace(SYSTEM_MODEL_LINE, (line) => line
+    .replace("You are powered by the model named", "Current model name:")
+    .replace("You are powered by the model", "Current model:")
+    .replace("The exact model ID is", "Model ID:")
+    .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:"))
+}
+
+// The reminder carrying CLAUDE.md files names the global one with a phrase
+// Factory refuses; only that phrase in the generated reminder changes.
+const INSTRUCTIONS_REMINDER = "<system-reminder>\nCodebase and user instructions are shown below"
+const GLOBAL_INSTRUCTIONS = "(user's private global instructions for all projects)"
 
 // Factory also refuses these fixed client phrases when they are quoted in
 // tool output, e.g. while reading this adapter's source. Keep the original
@@ -643,7 +677,7 @@ function anthropicBody(body) {
     const text = typeof body === "string" ? body
       : body instanceof ArrayBuffer ? Buffer.from(body).toString("utf8")
       : ArrayBuffer.isView(body) ? Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8") : ""
-    request = JSON.parse(text)
+    request = parseToolJSON(text)
   } catch {
     return body
   }
@@ -672,6 +706,12 @@ function anthropicBody(body) {
     if (block?.type === "text" && CLAUDE_IDENTITIES.has(block.text)) {
       block.text = DROID_LINE
       changed = true
+    } else if (block?.type === "text") {
+      const adapted = systemModelLine(block.text)
+      if (adapted !== block.text) {
+        block.text = adapted
+        changed = true
+      }
     }
     kept.push(block)
   }
@@ -702,6 +742,20 @@ function anthropicBody(body) {
       }
       continue
     }
+    // Claude Code 2.1.288 also sends the same context as an array of text
+    // blocks (#658): each text block is adapted as the string would be,
+    // the blocks' other fields and any other block left as they are.
+    if (message?.role === "system" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type !== "text" || typeof block.text !== "string") continue
+        const adapted = systemContext(block.text)
+        if (adapted !== block.text) {
+          block.text = adapted
+          changed = true
+        }
+      }
+      continue
+    }
     if (message?.role !== "user" || !Array.isArray(message.content)) continue
     for (const block of message.content) {
       if (block?.type === "tool_result") {
@@ -724,7 +778,17 @@ function anthropicBody(body) {
         continue
       }
       if (block?.type !== "text" || typeof block.text !== "string") continue
-      if (ENV_REMINDER.test(block.text)) {
+      if (block.text.startsWith(INSTRUCTIONS_REMINDER) && block.text.includes(GLOBAL_INSTRUCTIONS)) {
+        block.text = block.text.replaceAll(GLOBAL_INSTRUCTIONS, "(global instructions)")
+        changed = true
+      } else if (HOOK_OUTPUT.test(block.text) || SYSTEM_ENV_CONTEXT.test(block.text)) {
+        // a system message folded into the user's turn on its way here
+        const adapted = systemContext(block.text)
+        if (adapted !== block.text) {
+          block.text = adapted
+          changed = true
+        }
+      } else if (ENV_REMINDER.test(block.text)) {
         block.text = block.text.replace("# Environment", "# Runtime context")
           .replace("You have been invoked in the following environment:", "The session environment is:")
         changed = true
@@ -756,6 +820,24 @@ export const FactoryAuthPlugin = async ({ client }) => {
     const run = lock.then(fn, fn)
     lock = run.catch(() => {})
     return run
+  }
+  // renewed is what each refresh this process ran gave, by the refresh
+  // token it spent: a sign-in still holding that one (magpie not yet
+  // saving what auth.refresh gave, or a save that failed) goes on with
+  // the new tokens rather than spending the old one again
+  const renewed = new Map()
+  const took = (spent, c) => {
+    for (const [k, v] of renewed) if (v.expires > 0 && Date.now() >= v.expires) renewed.delete(k)
+    renewed.set(spent, { access: c.access, refresh: c.refresh, expires: c.expires, orgId: c.orgId, activeOrganizationId: c.activeOrganizationId, region: c.region, premBaseHost: c.premBaseHost })
+  }
+  // latest is c with the newest tokens this process got for it
+  const latest = (c) => {
+    for (let i = 0; i < 16 && c.refresh; i++) {
+      const got = renewed.get(c.refresh)
+      if (!got || got.access === c.access || (c.expires > 0 && got.expires > 0 && got.expires <= c.expires)) break
+      c = { ...c, ...got }
+    }
+    return c
   }
   // when each account last asked whoami for its org, so one whoami can't
   // answer doesn't ask before every request, nor hold back the others
@@ -819,16 +901,17 @@ export const FactoryAuthPlugin = async ({ client }) => {
     // it was, the built-in's clearing of the account's lapse.
     const fresh = (renewed) =>
       locked(async () => {
-        const c = await current()
+        const c = latest(await current())
         if (c.key) return keyed(c) // an API key: nothing to renew, and no org with it
         if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
+        const spent = c.refresh
         let t
         try {
-          t = await renew(c.refresh, "")
+          t = await renew(spent, "")
         } catch (e) {
           // a hiccup while the token still runs: go on with it
           if (!refused(e) && c.expires > 0 && Date.now() < c.expires) return orgOf(c)
-          if (refused(e)) throw Object.assign(new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`), { lapsed: true })
+          if (refused(e)) throw lapsed(c, e)
           throw e
         }
         c.access = t.access_token
@@ -837,6 +920,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         // droid asks whoami again for each new token, keeping the org it names
         await reconcile(c)
         ask(c)
+        took(spent, c)
         await save(c)
         renewed?.()
         return c
@@ -852,7 +936,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
       locked(async () => {
         if (status !== 403) return false
         const isOrg = orgRefused(status, text)
-        const c = await current()
+        const c = latest(await current())
         if (c.key) return false // an API key carries no org droid would send
         if (c.activeOrganizationId) {
           if (!isOrg) return false // the org was sent: the refusal is about something else
@@ -877,9 +961,10 @@ export const FactoryAuthPlugin = async ({ client }) => {
           org = await firstOrg(c)
         } catch {}
         if (!org) return false
+        const spent = c.refresh
         let t
         try {
-          t = await renew(c.refresh, org)
+          t = await renew(spent, org)
         } catch {
           return false
         }
@@ -887,6 +972,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         c.expires = expiry(t.access_token)
         c.orgId = org
         if (t.refresh_token) c.refresh = t.refresh_token
+        took(spent, c)
         await save(c)
         renewed?.()
         return true
@@ -928,6 +1014,18 @@ export const FactoryAuthPlugin = async ({ client }) => {
     return { fresh, mendOrg, usage }
   }
 
+  // lapsed is WorkOS refusing c's refresh token for good: the account
+  // needs signing in again
+  const lapsed = (c, e) =>
+    Object.assign(new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`), { lapsed: true, signIn: "expired" })
+
+  // renewal is what of c magpie keeps over the stored sign-in
+  const renewal = (c) => {
+    const out = { access: c.access, refresh: c.refresh, expires: c.expires }
+    for (const k of ["orgId", "activeOrganizationId", "region", "premBaseHost"]) if (typeof c[k] === "string") out[k] = c[k]
+    return out
+  }
+
   return {
     config: async (config) => {
       config.provider ??= {}
@@ -951,6 +1049,35 @@ export const FactoryAuthPlugin = async ({ client }) => {
         // droid's FACTORY_API_KEY: the key is the bearer, never renewed
         { type: "api", label: "Factory API key (fk-…)", placeholder: "fk-…" },
       ],
+      // magpie renews the sign-in MAGPIE_LEAD before its end, before its
+      // requests and usage ask for it, and saves what this gives. Under
+      // the same lock as the renewal before a request, so the two never
+      // spend one refresh token; that check stays for OpenCode, which
+      // doesn't call this
+      refreshLead: MAGPIE_LEAD,
+      async refresh(auth) {
+        if (auth?.type !== "oauth" || !auth.access || !auth.refresh) return undefined
+        return locked(async () => {
+          const c = latest({ ...auth })
+          // renewed here already, the store not yet saying so
+          if (c.access !== auth.access && c.expires > 0 && Date.now() < c.expires - MAGPIE_LEAD) return renewal(c)
+          const spent = c.refresh
+          let t
+          try {
+            t = await renew(spent, "")
+          } catch (e) {
+            if (refused(e)) throw lapsed(c, e)
+            throw e
+          }
+          c.access = t.access_token
+          c.expires = expiry(t.access_token)
+          if (t.refresh_token) c.refresh = t.refresh_token
+          await reconcile(c)
+          ask(c)
+          took(spent, c)
+          return renewal(c)
+        })
+      },
       // magpie's own hook: the account's limits
       async usage(getAuth) {
         return account(getAuth).usage()
@@ -983,10 +1110,12 @@ export const FactoryAuthPlugin = async ({ client }) => {
           // which Anthropic's SDK sends beside the bearer token
           if (path.includes("/llm/a/")) h.set("X-Api-Key", "placeholder")
           // another agent's request opens as droid's does (droidBody)
-          const out = path.includes("/llm/a/") && (path.endsWith("/messages") || path.endsWith("/messages/count_tokens"))
-            ? anthropicBody(body) : droidBody(path, body)
+          const anthropic = path.includes("/llm/a/") && (path.endsWith("/messages") || path.endsWith("/messages/count_tokens"))
+          const adapted = anthropic ? wrapAnthropicTools(anthropicBody(body)) : { body: droidBody(path, body), names: new Set() }
+          const out = adapted.body
           if (out !== body) h.delete("content-length")
-          return fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
+          const res = await fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
+          return path.endsWith("/messages") ? unwrapAnthropicTools(res, adapted.names) : res
         }
 
         return {

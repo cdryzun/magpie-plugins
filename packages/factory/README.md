@@ -29,9 +29,18 @@ The sign-in is kept wherever the host keeps provider sign-ins:
 It holds WorkOS's access and refresh tokens, with the organization,
 region and host.
 
-**Refreshing.** The access token is renewed two minutes before it lapses.
-WorkOS rotates the refresh token, so the plugin never runs two refreshes
-at once.
+**Refreshing.**
+- magpie renews the access token three minutes before it lapses, through
+  the plugin's `auth.refresh`, once for the account and before its
+  requests and usage need it; magpie saves the new tokens. OpenCode
+  doesn't call that hook: there the token is renewed two minutes before it
+  lapses, before a request, and the plugin saves it.
+- WorkOS rotates the refresh token, so the plugin never runs two refreshes
+  at once, and never spends one refresh token twice: a request that comes
+  before magpie has saved a renewal goes on with the new tokens.
+- The account counts as signed out only when WorkOS refuses the refresh
+  token (a 4xx other than 429). Any other failure keeps the sign-in, and
+  the current token is used while it lasts.
 
 **Refusals.** If Factory refuses the organization a request names, the
 plugin asks `whoami` again and resends the request once. If the refusal
@@ -122,3 +131,20 @@ organization region and upstream API. Connectivity has been verified with
 Sonnet 4.6, Sonnet 5.5 and Opus 5.5. Two-turn Read tool calls with Claude
 Code's default tool set have been verified with Sonnet 4.6 and Sonnet 5.5,
 including Sonnet 5.5 selected through a routing group.
+
+## Tool schema compatibility
+
+Factory's Anthropic route rejects tool schemas with root-level `anyOf`,
+`oneOf` or `allOf`. The plugin nests those schemas under an internal
+`arguments` property instead of removing their branch constraints. It
+wraps examples and previous tool inputs too, then unwraps tool replies
+before returning them to OpenCode or magpie. Ordinary object schemas and
+OpenAI routes keep their existing behavior.
+
+Local schema pointers are rebased to the nested schema; `$id` resources
+and anchors retain their resolution scope, and literal data is unchanged.
+Recursive schema resources
+without `$id` fail explicitly because nesting would change their scope.
+Affected streaming tool arguments are buffered until their content block
+is complete. Other events, tool ids, usage and upstream errors pass through;
+an incomplete or invalid argument envelope fails instead of being executed.

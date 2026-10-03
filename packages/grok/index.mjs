@@ -17,7 +17,8 @@ import { STATUS_CODES } from "node:http"
 const PROVIDER = "grok"
 const BASE = "https://cli-chat-proxy.grok.com/v1"
 const CLIENT_VERSION = "1.0.41"
-const REFRESH_MARGIN = 5 * 60 * 1000
+const REFRESH_MARGIN = 5 * 60 * 1000 // a token this close to its end is renewed before a request
+const LEAD_MS = REFRESH_MARGIN // and this close, magpie renews it ahead of time (auth.refresh)
 const LINK_WAIT = 30 * 1000
 const INSTALL = process.platform === "win32" ? "irm https://x.ai/cli/install.ps1 | iex" : "curl -fsSL https://x.ai/cli/install.sh | bash"
 
@@ -119,18 +120,32 @@ function run(file, args, opts) {
   })
 }
 
+// refreshing runs the CLI's renewals one after another; renewing is the one
+// asked for each home, which those who come while it is due or running join
+// rather than running the CLI there again.
 let refreshing = Promise.resolve()
+const renewing = new Map()
+
+// renew has the CLI renew the sign-in in home: a `grok models` there renews
+// it as any use of the CLI does.
+function renew(exe, home) {
+  let r = renewing.get(home)
+  if (!r) {
+    r = refreshing.then(() => run(exe, ["models"], { cwd: dirname(home), env: envFor(home) })).finally(() => renewing.delete(home))
+    refreshing = r.catch(() => {})
+    renewing.set(home, r)
+  }
+  return r
+}
 
 // token is the CLI's sign-in in home with a token still good. One about to
 // expire (or that a request found expired) is first renewed by the CLI in
-// its own home: a `grok models` there renews it as any use of the CLI does.
+// its own home.
 async function token(home, expired) {
   let c = credential(home)
   const exe = executable()
   if (c && exe && (expired || c.expires - Date.now() < REFRESH_MARGIN)) {
-    const done = refreshing.then(() => run(exe, ["models"], { cwd: dirname(home), env: envFor(home) }))
-    refreshing = done.catch(() => {})
-    await done
+    await renew(exe, home)
     c = credential(home)
   }
   if (!c) throw new Error("Grok is not signed in; run `grok login`")
@@ -468,6 +483,35 @@ export const GrokAuthPlugin = async ({ client }) => {
 
     auth: {
       provider: PROVIDER,
+      // magpie renews the sign-in LEAD_MS before its end, once for the
+      // account, before its requests, models and usage ask for it: the CLI
+      // renews it in its home, as before a request, and what it gives is
+      // read back. The check before each request stays for OpenCode, which
+      // doesn't call this.
+      refreshLead: LEAD_MS,
+      async refresh(auth) {
+        const home = auth?.refresh
+        if (auth?.type !== "oauth" || !home) return undefined
+        let c = credential(home)
+        // renewed already (by the CLI, or before a request), the store not
+        // yet saying so
+        const renewed = c && c.key !== auth.access && c.expires - Date.now() >= LEAD_MS
+        const exe = executable()
+        if (!renewed && exe) {
+          await renew(exe, home)
+          c = credential(home)
+        }
+        // the CLI holds no sign-in there any more (`grok logout`): one
+        // has to be made again
+        if (!c) throw Object.assign(new Error("Grok is not signed in; run `grok login`"), { signIn: "expired" })
+        // the CLI couldn't renew it: tried again later
+        if (exe && c.expires && c.expires <= Date.now()) throw new Error("Grok's sign-in has expired and Grok Build couldn't renew it")
+        if (c.key === auth.access && c.expires === auth.expires) return undefined
+        // magpie saves what this gives
+        const out = { access: c.key, expires: c.expires }
+        if (c.email && c.email !== auth.accountId) out.accountId = c.email
+        return out
+      },
       async loader(getAuth) {
         const auth = await getAuth()
         if (!auth || auth.type !== "oauth") return {}

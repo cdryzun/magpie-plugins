@@ -197,7 +197,9 @@ const EXPIRED_CLI = EXPIRED + " with `kiro-cli login` or the Kiro IDE"
 // there. The built-in marked no Kiro account lapsed, not even then, nor
 // cleared one: every answer and usage read says the account is kept.
 const gone = (msg) => Object.assign(new Error(msg), { gone: true })
-const fresh = (c) => c.method === "apikey" || !c.expires || c.expires - Date.now() > 2 * 60 * 1000
+const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is refreshed before a request
+const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
+const fresh = (c, early = EARLY_MS) => c.method === "apikey" || !c.expires || c.expires - Date.now() > early
 
 async function post(url, contentType, body, headers = {}) {
   let res
@@ -400,8 +402,23 @@ async function credOf(auth) {
 // Account holds the credentials in use, refreshing them when near their
 // end or when Kiro turned one down; one refresh at a time, as a refresh
 // may replace the refresh token.
+//
+// after is what each refresh gave, by the access token it replaced: a
+// sign-in read with that token (its save failed, or magpie hasn't yet
+// saved what auth.refresh gave) goes on with the newer one rather than
+// spending the replaced refresh token again.
 function account(client) {
   let held = null // { id, c }
+  const after = new Map()
+  const newest = (c) => {
+    for (let i = 0; i < 16 && after.has(c.access); i++) c = { ...after.get(c.access) }
+    return c
+  }
+  const renewed = (c, n) => {
+    after.set(c.access, n)
+    if (after.size > 16) after.delete(after.keys().next().value)
+    return n
+  }
   let lock = Promise.resolve()
   const locked = (fn) => {
     const run = lock.then(fn, fn)
@@ -414,12 +431,12 @@ function account(client) {
     await client.auth.set({ path: { id: ID }, body: { ...rest, type: "oauth", access: c.access, refresh: c.refresh, expires: c.expires,
       profileArn: c.profile, region: c.region } }).catch(() => {})
   }
-  return (auth, stale = false) =>
+  const creds = (auth, stale = false) =>
     locked(async () => {
       const id = auth?.type === "api" ? "key:" + auth.key : "oauth:" + (auth?.source ?? "own")
       // what its owner holds now: it may have refreshed it, signed out, or
       // signed in to another account since
-      const read = await credOf(auth)
+      let read = await credOf(auth)
       if (!read) {
         held = null
         throw gone(
@@ -428,6 +445,7 @@ function account(client) {
             : "this Kiro account's sign-in is gone; add it again in magpie",
         )
       }
+      read = newest(read)
       let c = held?.id === id ? held.c : null
       if (!c || read.access !== c.access || !fresh(c) || stale) {
         if (!read.profile && c && read.access === c.access) read.profile = c.profile
@@ -435,7 +453,7 @@ function account(client) {
         c = read
         if (!fresh(c) || stale) {
           if (c.method === "apikey") throw gone("Kiro turned down the API key saved on the provider")
-          c = await refresh(c)
+          c = renewed(c, await refresh(c))
           await save(auth, c)
         }
       }
@@ -446,6 +464,25 @@ function account(client) {
       held = { id, c }
       return { token: c.access, tokenType: tokenType(c), profile: c.profile, region: regionOf(c.profile, c.region) }
     })
+  // renew is auth.refresh's: a sign-in kept here (not kiro-cli's or the
+  // IDE's, which their owners keep) renewed under the same lock as the
+  // requests' refresh, so the two never spend one refresh token. It saves
+  // nothing — magpie saves what it gives — and gives only what changed.
+  creds.renew = (auth) =>
+    locked(async () => {
+      const read = await credOf(auth)
+      if (!read?.own || !read.refresh) return undefined
+      let c = newest(read)
+      // renewed here already (a request's refresh, or this hook's whose
+      // result magpie hasn't saved yet), the store not yet saying so
+      if (c.access === read.access || !fresh(c, LEAD_MS)) c = renewed(c, await refresh(c))
+      held = { id: "oauth:own", c }
+      const out = { access: c.access, expires: c.expires }
+      if (c.refresh !== auth.refresh) out.refresh = c.refresh
+      if (c.profile && c.profile !== auth.profileArn) out.profileArn = c.profile
+      return out
+    })
+  return creds
 }
 
 // ---- models ----------------------------------------------------------------------
@@ -1325,6 +1362,18 @@ export async function KiroAuthPlugin({ client } = {}) {
   return {
     auth: {
       provider: ID,
+      // magpie renews a sign-in kept here LEAD_MS before its end, once for
+      // the account, before its requests, models and usage ask for it; the
+      // check before each request stays for OpenCode, which doesn't call
+      // this. kiro-cli's and the IDE's sign-ins have no end magpie knows
+      // (expires 0) and are never asked for.
+      refreshLead: LEAD_MS,
+      // A failure is thrown as it is, a refusal too: the built-in marked
+      // no Kiro account lapsed (see gone).
+      async refresh(auth) {
+        if (auth?.type !== "oauth" || auth.source || !auth.access || !auth.refresh) return undefined
+        return creds.renew(auth)
+      },
       async loader(getAuth) {
         const auth = await getAuth()
         if (!(auth?.type === "api" && auth.key) && auth?.type !== "oauth") return {}

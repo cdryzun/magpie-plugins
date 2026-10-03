@@ -39,8 +39,23 @@ Power) and makes its requests, in OpenCode and in magpie. Provider id:
 A browser sign-in is kept where OpenCode keeps sign-ins (`auth.json`; in
 magpie, `plugin-auth.json`) as an `oauth` entry. The entry holds the
 tokens, the profile ARN, the region and, for AWS, the registered client.
-Tokens are refreshed 2 minutes before they expire, and also when Kiro
-turns one down (a 403, after which the request is tried once more):
+Refreshing such a sign-in:
+
+- magpie renews the token 10 minutes before it expires, through the
+  plugin's `auth.refresh`, once for the account and before its requests,
+  models and usage need it. magpie saves the new token. A failed renewal,
+  even one Kiro refused, doesn't mark the account: it is tried again.
+- OpenCode doesn't call that hook: there the token is refreshed 2 minutes
+  before it expires, before a request, and saved.
+- Either way, a token Kiro turns down (a 403) is refreshed and the request
+  tried once more.
+- Only one refresh runs at a time, magpie's renewal included, and a token
+  refreshed but not yet saved is used rather than spending the old refresh
+  token again.
+- kiro-cli's and the IDE's sign-ins aren't renewed by magpie: they are
+  refreshed before a request, as above, and written back.
+
+Tokens are refreshed through:
 
 - Google/GitHub: through `prod.<region>.auth.desktop.kiro.dev/refreshToken`.
 - Builder ID/Identity Center: through AWS's `oidc.<region>.amazonaws.com/token`.

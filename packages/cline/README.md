@@ -15,15 +15,25 @@ Provider id: `cline`.
 
 The sign-in is kept where OpenCode keeps auth (`auth.json` under the data
 directory); magpie keeps plugin sign-ins in its own store
-(`~/.config/magpie/plugin-auth.json`). Access tokens are renewed through
-`/api/v1/auth/refresh` when they near expiry — Cline rotates the refresh
-token, and the rotated pair is saved back the moment it arrives (and kept in
-memory beside the store, so a save that fails can't leave the next request
-spending the token that was already spent). Refreshes are serialized, so two
-requests renewing at once can't spend one token and lose the other. A refresh
-that fails for a while keeps the token that is still good, as Cline's own
-client does; only a token that has actually expired is treated as the sign-in
-gone.
+(`~/.config/magpie/plugin-auth.json`).
+
+Refreshing:
+- Access tokens are renewed through `/api/v1/auth/refresh`. Cline rotates
+  the refresh token and refuses one already spent, so the rotated pair is
+  kept in memory beside the store the moment it arrives: a save that fails
+  can't leave the next request spending the token that was already spent.
+- magpie renews the token ten minutes before it ends, through the plugin's
+  `auth.refresh`, once for the account and before its requests, models and
+  usage need it; magpie saves the new pair. OpenCode doesn't call that hook:
+  there the token is refreshed five minutes before it ends, before a
+  request, and the new pair is saved.
+- Refreshes are serialized, magpie's renewal included, so two at once can't
+  spend one token and lose the other; one that finds the token already
+  renewed uses that pair.
+- A refresh that fails for a while keeps the token that is still good, as
+  Cline's own client does (magpie tries its renewal again shortly); only a
+  refresh Cline refuses, or a token that has actually expired, is treated as
+  the sign-in gone.
 
 ## Requests
 

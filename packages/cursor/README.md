@@ -54,7 +54,12 @@ plugin's `fetch` answers them on Cursor's agent API:
   or not. Cursor's `input_tokens` counts the cached prompt too: the cache
   read and written is taken out of it, and given as `cached_tokens` and
   `cache_write_tokens`, so it is counted once; its reasoning tokens are
-  `reasoning_tokens`. Failures keep their statuses: 401 to sign in again, 429 at the
+  `reasoning_tokens`. A step that calls tools gets no usage in its Run
+  (Cursor tells it only once the tools' results come back in the same
+  Run), so once the Run is closed its usage is read from the dashboard's
+  usage events, by the Run's conversation id: it shows in about 2.5 s,
+  and is looked for up to 6 s, after which it is estimated as before.
+  Failures keep their statuses: 401 to sign in again, 429 at the
   usage limit, 400 for a prompt too long, 403 for a region refusal.
 
 ## Models
