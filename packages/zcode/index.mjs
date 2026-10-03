@@ -206,7 +206,7 @@ async function preferStart(s, model, enabled) {
   if (!enabled || typeof model !== "string" || model.toLowerCase() !== flashModel || !s.key || !s.jwt || isTeam(s)) {
     return onStart(s)
   }
-  return startHasFlash(await flashAllowance(s))
+  return !jwtExpired(s.jwt) && startHasFlash(await flashAllowance(s))
 }
 
 function startRefused(status, text = "") {
@@ -1375,4 +1375,4 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT, startHasFlash, startRefused, restStart, startPriority }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT, startHasFlash, startRefused, restStart, startPriority, preferStart }

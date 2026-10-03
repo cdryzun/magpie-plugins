@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { _internal } from "./index.mjs"
 
-const { startHasFlash, startRefused, restStart, startPriority } = _internal
+const { startHasFlash, startRefused, restStart, startPriority, preferStart } = _internal
 
 // Captured from the account's real balance on 2026-10-03; no sign-in data.
 const allowance = {
@@ -39,6 +39,11 @@ test("Start refuses rate limits and quota failures, not arbitrary server errors"
   expect(startRefused(502, "connection reset")).toBe(false)
   expect(startRefused(400, "invalid model")).toBe(false)
   expect(startRefused(200)).toBe(false)
+})
+
+test("an expired Start sign-in selects Coding without a balance request", async () => {
+  const jwt = "e30." + Buffer.from(JSON.stringify({ exp: 1 })).toString("base64url") + ".signature"
+  expect(await preferStart({ key: "coding", jwt }, "GLM-5.3-Flash", true)).toBe(false)
 })
 
 test("retry-after supports seconds and HTTP dates and has a one-hour ceiling", () => {
