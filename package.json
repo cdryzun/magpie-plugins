@@ -1,11 +1,16 @@
 {
   "name": "@magpie-community/opencode-zcode-auth",
-  "version": "0.1.9",
+  "version": "0.1.10-start.1",
   "private": true,
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
-  "files": ["index.mjs", "packages/zcode/index.mjs", "packages/zcode/prompt.mjs", "packages/zcode/README.md"],
+  "files": [
+    "index.mjs",
+    "packages/zcode/index.mjs",
+    "packages/zcode/prompt.mjs",
+    "packages/zcode/README.md"
+  ],
   "scripts": {
     "check": "bun scripts/check.mjs"
   }

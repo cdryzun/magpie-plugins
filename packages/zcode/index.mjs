@@ -240,6 +240,43 @@ const giftServes = (gift, m) => (gift.models ?? []).some((x) => x.toLowerCase() 
 const giftUsable = (s, gift, m) => !jwtExpired(s.jwt) && giftServes(gift, m) &&
   Date.now() >= (blocked.get(s.key + "\0" + s.jwt + "\0" + m.toLowerCase()) ?? 0)
 
+// The fork's entry asks the Start Plan for GLM-5.3-Flash before the coding
+// plan, and replays a refused Start turn once on the coding plan, so a
+// spent or limited Start never stops the turn.
+const flashModel = "glm-5.3-flash"
+const START_REFUSED = new Set([401, 403, 405, 429])
+const START_REFUSED_TEXT = /exceed|quota|rate.?limit|too many requests|insufficient|usage limit|limit reached|本轮|额度|限流/i
+
+// startRefused is a Start answer worth one coding retry: its own words for
+// an exhausted or throttled plan, or a status that only ever means "not
+// now". A bad request or a genuine server fault goes on as it came.
+function startRefused(status, text = "") {
+  if (status === 200) return false
+  if (START_REFUSED.has(status)) return true
+  return status >= 400 && status < 600 && START_REFUSED_TEXT.test(text)
+}
+
+// refusalText reads what a refusal said, bounded: a vendor error is a short
+// JSON line, and nothing else about it is wanted.
+async function refusalText(res) {
+  try {
+    return (await res.clone().text()).slice(0, 4096)
+  } catch {
+    return ""
+  }
+}
+
+// restStart keeps Flash on the coding plan for a while after Start refused:
+// the retry-after it gave, or a minute. The model's own key in blocked is
+// what giftUsable reads, so one refused turn does not ask twice.
+function restStart(s, retryAfter, now = Date.now()) {
+  const seconds = Number(retryAfter)
+  const until = Date.parse(retryAfter)
+  const wait = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000
+    : Number.isFinite(until) && until > now ? until - now : 60_000
+  blocked.set(s.key + "\0" + s.jwt + "\0" + flashModel, now + Math.min(Math.max(wait, 1000), 60 * 60_000))
+}
+
 // spentUp is the gift saying it has nothing left to spend: its own no-
 // resource-package code 1113, its "exceed quota limit" 1005 — a spent gift
 // can answer a 200 with a JSON body carrying one of those codes. Every 429
@@ -576,7 +613,7 @@ function bestBuckets(windows) {
 // Fresh usage also updates the request cache, so a replenished or spent
 // gift takes effect before its ten-minute route cache expires. A failed
 // gift read leaves the working Coding Plan's card and route alone.
-async function dualUsage(s) {
+async function dualUsage(s, { startFlashFirst = false } = {}) {
   const out = await codingUsage(s)
   const cached = routes.get(s.key + "\0" + s.jwt)
   try {
@@ -594,11 +631,20 @@ async function dualUsage(s) {
       // on the coding plan, and the user picks the gift by its entry
       const notModels = gift.allModels.map((m) => giftID(m).toLowerCase())
       if (notModels.length) out.windows = out.windows.map((w) => w.aside ? w : { ...w, notModels })
+      // This fork spends a live Start bucket's Flash on the plain model
+      // before the coding plan: that bucket's window carries the plain
+      // Flash model and the coding windows drop it, so routing and the
+      // card both count the pool a turn will actually spend. Once the
+      // bucket is spent it stops being in gift.models, the coding windows
+      // count Flash again, and the spent sibling can hold nothing up.
+      const startFlash = startFlashFirst && (gift?.models ?? []).some((m) => m.toLowerCase() === flashModel)
+      if (startFlash) out.windows = out.windows.map((w) => w.aside ? w : { ...w, notModels: [...new Set([...(w.notModels ?? []), flashModel])] })
       // Several buckets may serve one model: one spent sibling cannot block it.
       const best = bestBuckets(g.windows)
       out.windows.push(...g.windows.map(({ _plan: p, _spent, ...w }, i) => {
         const selected = gift.allModels.filter((m) => best.get(m.toLowerCase()) === i)
         const models = selected.map(giftID)
+        if (startFlash && selected.some((m) => m.toLowerCase() === flashModel)) models.push("GLM-5.3-Flash")
         const scoped = models.length ? { ...w, models } : { ...w, aside: true }
         // the card names a bucket's model as the picker does (GLM-5.3-Flash-Trial);
         // no plan prefix — the card's section header already says the account
@@ -1339,7 +1385,7 @@ function dress(text, site, device) {
 
 // ---- the plugin ------------------------------------------------------------------
 
-export async function ZCodeAuthPlugin({ client }) {
+export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = {}) {
   const log = (message) => {
     try {
       client?.app?.log?.({ body: { service: "zcode-auth", level: "error", message } })
@@ -1419,6 +1465,7 @@ export async function ZCodeAuthPlugin({ client }) {
             // says it is spent can spend nothing and replay what was asked for
             let start = alone
             let orig, forcedGift = false
+            let autoStart = false
             if (opts.body != null) {
               orig = opts.body = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
               delete opts.duplex
@@ -1436,6 +1483,23 @@ export async function ZCodeAuthPlugin({ client }) {
                 forcedGift = true
               }
               start = alone || forcedGift
+              // the fork's entry spends a served Flash on the Start Plan
+              // before the coding plan: a spent or limited Start is handled
+              // by the retry below, so the turn still lands on Coding
+              if (startFlashFirst && !start && m.toLowerCase() === flashModel && s.key && !isTeam(s)) {
+                gift ??= await startPlan(s.jwt, s.device).catch(() => null)
+                if (giftUsable(s, gift, flashModel)) (start = true), (autoStart = true)
+              }
+            }
+            // retrying the auto-Start turn on the coding plan: the agent's
+            // own body and headers, with the plan's key on
+            const original = { ...opts }
+            const onCoding = () => {
+              const h2 = new Headers(original.headers)
+              h2.delete("authorization")
+              h2.set("x-api-key", s.key)
+              h2.set("Authorization", "Bearer " + s.key)
+              return fetch(s.base + url.slice(START_BASE.length), { ...original, headers: h2 })
             }
             const swap = (base) => {
               for (const b of [START_BASE, ZAI_BASE, BIGMODEL_BASE]) {
@@ -1465,7 +1529,36 @@ export async function ZCodeAuthPlugin({ client }) {
               h.set("x-api-key", key)
               h.set("Authorization", "Bearer " + key)
             }
-            let res = await fetch(url, { ...opts, headers: h })
+            let res
+            try {
+              res = await fetch(url, { ...opts, headers: h })
+            } catch (e) {
+              // the Start Plan did not answer at all: the turn is still worth
+              // serving, unless the agent itself asked to stop
+              if (!autoStart || opts.signal?.aborted) throw e
+              restStart(s, null)
+              res = await onCoding()
+            }
+            // an auto-Start turn Start refused is replayed once on Coding:
+            // its own quota or rate-limit words, or a status that only ever
+            // means "not now". Only a refusal is read — a streaming answer
+            // must never be buffered to look for words it does not have.
+            if (autoStart && !res.ok && startRefused(res.status, await refusalText(res))) {
+              restStart(s, res.headers.get("retry-after"))
+              await res.body?.cancel().catch(() => {})
+              res = await onCoding()
+            }
+            // a spent Start can answer 200 with a JSON quota error body;
+            // that too is replayed on Coding before the agent sees it
+            if (autoStart && res.ok && (res.headers.get("content-type") ?? "").includes("application/json")) {
+              const text = await res.text()
+              if (spentUp(text, res.status)) {
+                restStart(s, null)
+                res = await onCoding()
+              } else {
+                res = kept(new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers }))
+              }
+            }
             // a trial entry's gift answer that can't serve the request is
             // the agent's answer, not the coding plan's: the user picked the
             // gift, so a spent bucket says 429 (its quota error inside a 200
@@ -1524,7 +1617,7 @@ export async function ZCodeAuthPlugin({ client }) {
           }
           const { start, gift } = await plansOf(s)
           if (start) return saved(await startUsage(s))
-          if (gift) return saved(await dualUsage(s))
+          if (gift) return saved(await dualUsage(s, { startFlashFirst }))
           return saved(await codingUsage(s))
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
@@ -1555,4 +1648,4 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, spentUp, giftServes, startRefused, restStart, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
