@@ -58,11 +58,14 @@ const MODELS = [
   ["gpt-5.3-codex", "GPT-5.3-Codex", RESPONSES, "openai", 400000, 128000, E4, true],
   ["grok-4.7", "Grok 4.7", RESPONSES, "xai", 500000, 63356, E4, true],
   ["grok-4.6", "Grok 4.6", RESPONSES, "xai", 200000, 63356, E4, true],
+  // reasoning is mandatory on GLM-5.3 and GLM-5.3-Flash (Fireworks turns
+  // none away): low is their least. GLM-5.2, Kimi K3 and DeepSeek V4.1
+  // Flash stop thinking at none, droid's "off" (yetone/magpie#899).
   ["glm-5.3", "GLM-5.3", CHAT, "fireworks", 1040000, 131072, ["low", "high", "max"], false],
   ["glm-5.3-flash", "GLM-5.3-Flash", CHAT, "fireworks", 1048576, 131072, ["low", "high", "max"], true],
-  ["glm-5.2", "GLM-5.2", CHAT, "baseten", 1040000, 131072, ["high", "max"], false],
-  ["kimi-k3", "Kimi K3", CHAT, "fireworks", 262144, 65536, ["low", "high", "max"], true],
-  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", CHAT, "fireworks", 1040000, 131072, ["low", "high", "max"], true],
+  ["glm-5.2", "GLM-5.2", CHAT, "baseten", 1040000, 131072, ["none", "high", "max"], false],
+  ["kimi-k3", "Kimi K3", CHAT, "fireworks", 262144, 65536, ["none", "low", "high", "max"], true],
+  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", CHAT, "fireworks", 1040000, 131072, ["none", "low", "high", "max"], true],
   ["qwen3.8-max", "Qwen3.8 Max", CHAT, "fireworks", 262144, 131072, ["low", "medium", "xhigh"], false],
   ["minimax-m3", "MiniMax M3", CHAT, "fireworks", 512000, 64000, ["high"], true],
   ["minimax-m2.7", "MiniMax M2.7", ANTHROPIC, "fireworks", 196600, 64000, ["high"], false],

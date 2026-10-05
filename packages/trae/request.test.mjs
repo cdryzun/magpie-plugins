@@ -194,6 +194,33 @@ test("a native call's pieces that say neither id nor name join the call being wr
   expect(nc.take().map((t) => [t.id, t.name, JSON.parse(t.arguments)])).toEqual([["w1", "write", { path: "a.py", content: "x\ny" }]])
 })
 
+test("a whole snapshot Trae sends again, written apart from the partial one, replaces it, not joins it (plugins#24)", () => {
+  const nc = new _internal.NativeCalls()
+  nc.push({ id: "b1", function: { name: "bash", arguments: '{"command":"git log -' } })
+  // the same call again, whole, its punctuation not the partial one's
+  nc.push({ id: "b1", function: { arguments: '{"command":"git log −1 --format=′%s′"}' } })
+  expect(nc.take().map((t) => [t.name, JSON.parse(t.arguments)])).toEqual([["bash", { command: "git log −1 --format=′%s′" }]])
+})
+
+test("pieces that are JSON values of their own still join the call (plugins#24)", () => {
+  for (const pieces of [
+    ['{"n":', "12", "}"],
+    ['{"cmd":', '"ls"', "}"],
+    ['{"a":', "{}", "}"],
+    ['{"a":{"b":1},', '"c":', '{"b":2}', "}"],
+    ["{", "}"],
+  ]) {
+    const nc = new _internal.NativeCalls()
+    nc.push({ id: "x", function: { name: "t", arguments: pieces[0] } })
+    for (const p of pieces.slice(1)) nc.push({ id: "x", function: { arguments: p } })
+    expect(JSON.parse(nc.take()[0].arguments)).toEqual(JSON.parse(pieces.join("")))
+  }
+  // snapshots as before: each the arguments so far
+  const nc = new _internal.NativeCalls()
+  for (const s of ['{"p', '{"path":"a', '{"path":"a.py"}']) nc.push({ id: "r", function: { name: "read", arguments: s } })
+  expect(JSON.parse(nc.take()[0].arguments)).toEqual({ path: "a.py" })
+})
+
 test("looseJSON reads raw control characters in strings only", () => {
   expect(_internal.looseJSON('{"a":"x\ny","b":"\\"q\\""}')).toEqual({ a: "x\ny", b: '"q"' })
   expect(_internal.looseJSON('{"a":\n1}')).toEqual({ a: 1 })

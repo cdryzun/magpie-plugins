@@ -71,3 +71,15 @@ leaves these out:
 Grok 4.7 until signed in. Signed in, the models are the ones the account
 lists at `/v1/models` (Responses models only), each with its context
 window and its reasoning efforts as variants.
+
+## Usage
+
+magpie's card shows the credits of the current period
+(`/v1/billing?format=credits`): weekly for SuperGrok, with on-demand
+spending beside it when it has a cap.
+
+Grok's billing says nothing of a plan's rate limit, so a free account can
+read 0% used while its requests come back 429. After a 429 the card shows
+a spent "Rate limit" window until the reset it named (`Retry-After`, or a
+`*ratelimit*reset*` header). When it named none, the window stays until a
+request goes through, or for 5 minutes.

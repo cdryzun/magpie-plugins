@@ -4,7 +4,8 @@
 // approves, traded at Cline's register endpoint for the account's token pair —
 // or a plain API key from app.cline.bot. Chat completions go to Cline's
 // gateway in OpenAI's format; the model list comes from its recommended-models
-// and cloud-models feeds; usage reads the account's credit balance.
+// and cloud-models feeds; usage reads the account's credit balance and, on
+// ClinePass, the plan's 5-hour, weekly and monthly limits.
 import { STATUS_CODES } from "node:http"
 import { randomUUID } from "node:crypto"
 
@@ -663,8 +664,34 @@ function balanceOf(v) {
 	return w
 }
 
-function usageOf(me, balance) {
-	const out = { windows: [] }
+// LIMITS are ClinePass's three limits as /users/me/plan/usage-limits names
+// them (app.cline.bot's subscription page reads the same): a rolling 5
+// hours, the calendar week and the calendar month
+const LIMITS = {
+	five_hour: { name: "5 hours", span: 5 * 60 * 60 },
+	weekly: { name: "Weekly", span: 7 * 24 * 60 * 60 },
+	monthly: { name: "Month", span: 30 * 24 * 60 * 60 },
+}
+
+// limitWindows are the plan's limits, {limits: [{type, percentUsed,
+// resetsAt}]}, in LIMITS' order; a type it doesn't know is left out, as the
+// dashboard leaves it
+function limitWindows(v) {
+	const out = []
+	for (const l of Array.isArray(v?.limits) ? v.limits : []) {
+		const k = LIMITS[l?.type]
+		if (!k) continue
+		const n = Number(l.percentUsed ?? 0)
+		const w = { name: k.name, used: Math.min(100, Math.max(0, Number.isFinite(n) ? n : 0)), span: k.span }
+		const at = timeOf(l, ["resetsAt"])
+		if (at) w.resetsAt = at
+		out.push([Object.keys(LIMITS).indexOf(l.type), w])
+	}
+	return out.sort((a, b) => a[0] - b[0]).map(([, w]) => w)
+}
+
+function usageOf(me, balance, limits) {
+	const out = { windows: limitWindows(limits) }
 	const plan = firstOf(me?.plan, me?.planType, me?.planName, me?.membership, me?.tier)
 	if (plan) out.plan = plan
 	const w = balanceWindow(balance) ?? balanceOf(balance)
@@ -799,13 +826,16 @@ export const ClinePlugin = async ({ client } = {}, options = {}) => {
 			signIn: e?.expired ? "expired" : undefined,
 		})
 
-	// usage is the account's credit balance, magpie's own hook. A read the
-	// account's token couldn't make is the sign-in, not the read.
+	// usage is the account's credit balance and its ClinePass limits,
+	// magpie's own hook. A read the account's token couldn't make is the
+	// sign-in, not the read; the limits are asked alongside and an account
+	// without ClinePass (or one they can't be read for) just has none.
 	const usage = async (getAuth) => {
 		try {
 			const cred = await fresh(getAuth)
 			const authz = { Authorization: `Bearer ${cred.bearer}` }
 			const me = await clineApi(`${API}/users/me`, { headers: authz })
+			const limits = clineApi(`${API}/users/me/plan/usage-limits`, { headers: authz, lapsed: () => false }).catch(() => null)
 			const ids = [me?.clineUserId, me?.subject, me?.id, cred.uid].filter((v) => typeof v === "string" && v.trim())
 			let balance = null
 			let lastErr = null
@@ -818,7 +848,7 @@ export const ClinePlugin = async ({ client } = {}, options = {}) => {
 				}
 			}
 			if (!balance) throw lastErr ?? new Error("Cline usage: no user id")
-			return { ...usageOf(me, balance), user: firstOf(cred.accountId, cred.email, cred.uid, ids[0]), signIn: renewed(cred) ? "renewed" : "kept" }
+			return { ...usageOf(me, balance, await limits), user: firstOf(cred.accountId, cred.email, cred.uid, ids[0]), signIn: renewed(cred) ? "renewed" : "kept" }
 		} catch (e) {
 			return { windows: [], error: e?.message ?? String(e), signIn: e?.expired ? "expired" : "kept" }
 		}
@@ -967,6 +997,7 @@ export const _internal = {
 	balanceWindow,
 	usd,
 	usageOf,
+	limitWindows,
 	failure,
 	errorResponse,
 	bodyText,

@@ -28,11 +28,37 @@ test("a check-in page is sent as the account, its answer back as it is", async (
   expect(f.seen.map((r) => r.path)).toEqual(["/trae/api/v2/ug/checkin_credits/status", "/trae/api/v2/ug/checkin_credits/claim"])
   for (const r of f.seen) {
     expect(r.method).toBe("POST")
-    expect(r.json).toEqual({})
+    // as Trae CN's IDE sends it (yetone/magpie#808): {req_source: 1}, its
+    // device headers and a client's User-Agent, not Bun's
+    expect(r.json).toEqual({ req_source: 1 })
     expect(r.headers.get("authorization")).toBe("Cloud-IDE-JWT jwt-1")
     expect(r.headers.get("x-device-id")).toBe("1234567890123456789")
-    expect(r.headers.get("x-uid")).toBe("u-1")
+    expect(r.headers.get("x-device-type")).toBe("Windows")
+    expect(r.headers.get("x-os-version")).toBe("10.0.22631")
+    expect(r.headers.get("x-app-version")).toBe("0.1.69")
+    expect(r.headers.get("x-device-brand")).toBeTruthy()
+    expect(r.headers.get("user-agent")).toMatch(/^Mozilla\/5\.0 \(Windows NT 10\.0; Win64; x64\) .*TRAE-SOLO-CN\/0\.1\.69 Chrome\/[\d.]+ Electron\/[\d.]+ Safari\/537\.36$/)
+    expect(r.headers.get("user-agent")).not.toMatch(/Bun/)
+    // not the chat's
+    for (const h of ["x-uid", "x-ide-token", "x-cloudide-token", "x-ide-version", "x-machine-id"]) expect(r.headers.has(h)).toBe(false)
   }
+})
+
+test("a check-in's own body is sent as given", async () => {
+  f = fakeTrae()
+  f.route("POST /trae/api/v2/ug/checkin_credits/status", () => json({ code: 0, enable: true, checked_in: true }))
+  const o = await fetcher()
+  await o.fetch(f.origin + "/trae/api/v2/ug/checkin_credits/status", { method: "POST", body: '{"req_source":2}' })
+  expect(f.seen[0].json).toEqual({ req_source: 2 })
+})
+
+test("Trae's other pages still go with the chat's headers", async () => {
+  f = fakeTrae()
+  f.route("POST /trae/api/v2/pay/ide_user_ent_usage", () => json({ code: 0 }))
+  const o = await fetcher()
+  await o.fetch(f.origin + "/trae/api/v2/pay/ide_user_ent_usage", { method: "POST", body: "{}" })
+  expect(f.seen[0].json).toEqual({})
+  expect(f.seen[0].headers.get("x-uid")).toBe("u-1")
 })
 
 test("a token Trae turns away marks the sign-in", async () => {

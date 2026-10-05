@@ -144,7 +144,7 @@ test("ZCode's Start Plan: its buckets, each for its models", async () => {
     signIn: "kept",
     plan: "Start Plan", until: new Date((now + 7 * 86400) * 1000).toISOString(), renew: "off",
     windows: [{ name: "GLM-5.1", used: 25, display: "250000 / 1000000", resetsAt: new Date((now + 3600) * 1000).toISOString(), span: 86400,
-      models: ["GLM-5.1"] }],
+      models: ["GLM-5.1", "GLM-5.1-Trial"] }],
   })
   expect(calls[0].url.origin).toBe("https://zcode.z.ai")
   expect(calls[0].headers["X-Device-Mid"]).toBe("11111111-2222-4333-8444-555555555555")
@@ -159,7 +159,7 @@ test("ZCode's Start Plan: its buckets, each for its models", async () => {
   balance = startBalance(now, "active")
   balance.balances = [{ plan_id: "zai-start-plan", capabilities: [" model: GLM-5-Turbo ", "model:"], total_units: 200, remaining_units: "150",
     period_start: now, period_end: now + 7 * 86400 }]
-  expect((await usage(auth)).windows).toEqual([{ name: "GLM-5-Turbo", used: 25, display: "50 / 200", span: 7 * 86400, models: ["GLM-5-Turbo"] }])
+  expect((await usage(auth)).windows).toEqual([{ name: "GLM-5-Turbo", used: 25, display: "50 / 200", span: 7 * 86400, models: ["GLM-5-Turbo", "GLM-5-Turbo-Trial"] }])
 
   // its token run out
   expect(await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).toEqual({ signIn: "kept", error: "ZCode's sign-in has expired; sign in to ZCode again (or add the account again in magpie)" })

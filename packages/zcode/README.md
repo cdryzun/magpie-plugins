@@ -54,30 +54,32 @@ Before each request, the plugin checks which plan the account is on, and
 asks again every 10 minutes:
 
 - If the key's account has a GLM Coding Plan
-  (`/api/biz/subscription/list`), its requests go to that plan —
-  except for a model the account's gift plans also serve, which goes to
-  the gift first (see below).
+  (`/api/biz/subscription/list`), its requests go to that plan. A model
+  the account's gift plans also serve is listed again as
+  `<model>-Trial`; asking that entry spends the gift (see below).
 - Otherwise they go to the gift plans.
 
 Every request carries the key as both `x-api-key` and
 `Authorization: Bearer`.
 
-**Spending the gift first.** An account with a GLM Coding Plan can also
-hold gift plans from ZCode activities, ones that expire on a fixed date.
-Their allowance would lapse unused if every request went to the coding
-plan, so the plugin reads the gift's balance (per the sign-in's session,
-kept for 10 minutes) and sends a request for a model the gift still has
-quota to spend to the gift first, dressed as ZCode's own. A bucket is
-judged spent only by its `remaining_units` — a missing one is unknown,
-not spent — and a model whose every bucket says none goes straight to
-the coding plan without asking. When the gift can't serve the request —
-any answer 400 or over (its 405, its 401, its 5xx), or its quota error
+**The gift's trial entries.** An account with a GLM Coding Plan can
+also hold gift plans from ZCode activities, ones that expire on a fixed
+date. Their allowance would lapse unused if every request went to the
+coding plan, so the plugin reads the gift's balance (per the sign-in's
+session, kept for 10 minutes) and lists every model a live bucket
+serves again as `<model>-Trial`, named in the catalog's spelling
+(GLM-5.3-Flash-Trial). Asking a trial entry sends the model to the
+gift, dressed as ZCode's own; asking the plain model spends the coding
+plan — the choice is the user's. A bucket is judged spent only by its
+`remaining_units` — a missing one is unknown, not spent. A trial entry
+whose bucket is spent or blocked answers 429 without touching the
+coding plan; when the gift answers a trial entry with a quota error
 (code 1113 "Insufficient balance or no resource package", code 1005
-"exceed quota limit", which it can answer inside an HTTP 200) — the
-plugin replays the request once to the coding plan, as the agent sent
-it. Only a quota answer keeps that model off the gift for a minute; a
-refusal that says nothing about quota is asked again next request. Every
-429 counts as spent, Z.ai's 1302/1303 rate limits among them. A stream's
+"exceed quota limit", which it can answer inside an HTTP 200) that too
+becomes a 429 and keeps the entry off for a minute. Any other gift
+answer (its 405, its 401, its 5xx) goes on as it came: the user picked
+the gift, so the coding plan is not spent behind their back. Every 429
+counts as spent, Z.ai's 1302/1303 rate limits among them. A stream's
 body is never read or buffered on the way.
 
 ## The usage card
@@ -108,3 +110,14 @@ minutes. When the config can't be read, the plugin falls back to this list:
 | GLM-5-Turbo | 200K | 64K | none, high |
 
 The Start Plan has all of these except GLM-5.3.
+
+A gift plan's models appear again as `<model>-Trial` entries, so a
+request can spend the gift's quota on purpose. A trial entry is listed
+while any live bucket serves its model, spent buckets included (a spent
+entry answers 429 rather than vanishing mid-session).
+
+Two plans can give one model (ZCode Trust Build and the Start Plan both
+give GLM-5.3-Flash). The server picks the bucket, so the usage card
+counts the model on its live bucket, the least used, and sets a spent
+sibling aside. A spent sibling never makes the model, or the account,
+look used up while another bucket still has quota.

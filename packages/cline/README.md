@@ -51,7 +51,10 @@ requests carry the same identity. A finished non-streaming answer rides in a
 apart too. The model list is read from
 `/api/v1/ai/cline/recommended-models` and `/api/v1/ai/cline/models` (neither
 needs a sign-in); usage reads `/api/v1/users/me` and the account's `/balance`
-(its balance is counted in millionths of a dollar).
+(its balance is counted in millionths of a dollar), and ClinePass's 5-hour,
+weekly and monthly limits from `/api/v1/users/me/plan/usage-limits`
+(`{limits: [{type, percentUsed, resetsAt}]}`, what app.cline.bot's
+subscription page shows); an account without ClinePass has none.
 
 ### DeepSeek models only through DeepSeek's own API
 

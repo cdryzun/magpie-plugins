@@ -29,6 +29,12 @@ const TOOLS = new Set(["function", "web_search", "x_search", "image_generation",
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 const LINK = /https:\/\/\S+/
 
+// linkIn is the page a line of `grok login` gives to open, "" for none: a
+// line saying it failed names the endpoint it couldn't reach (`Error: error
+// sending request for url (https://auth.x.ai/oauth2/device/code): …`),
+// which is no page to open.
+const linkIn = (line) => (/\berror\b/i.test(line) ? "" : (line.match(LINK)?.[0] ?? ""))
+
 // ---- the CLI ------------------------------------------------------------------
 
 // cliHome is where the CLI keeps its own sign-in and settings.
@@ -300,26 +306,30 @@ function login(exe, home, own) {
       const line = buf.slice(0, i).replace(/\r$/, "").replace(ANSI, "").trim()
       buf = buf.slice(i + 1)
       if (line) tail.push(line)
-      const u = line.match(LINK)?.[0]
+      const u = linkIn(line)
       if (u) found(u)
     }
   }
   child.stdout.on("data", onData)
   child.stderr.on("data", onData)
   const done = new Promise((resolve) => {
-    child.on("error", (e) => resolve({ ok: false, why: e.message }))
+    child.on("error", (e) => {
+      tail.push(e.message)
+      found("")
+      resolve({ ok: false, why: e.message })
+    })
     child.on("close", (code) => {
       const rest = buf.replace(ANSI, "").trim()
       if (rest) {
         tail.push(rest)
-        const u = rest.match(LINK)?.[0]
+        const u = linkIn(rest)
         if (u) found(u)
       }
       found("")
       resolve({ ok: code === 0, why: tail.at(-1) ?? "grok login didn't finish" })
     })
   })
-  return { child, link, done }
+  return { child, link, done, tail }
 }
 
 function newHome() {
@@ -336,12 +346,15 @@ async function signIn() {
   if (!exe) throw new Error(`install Grok Build first: ${INSTALL}`)
   const own = !!credential(cliHome())
   const home = own ? newHome() : cliHome()
-  const { child, link, done } = login(exe, home, own)
+  const { child, link, done, tail } = login(exe, home, own)
   const url = await Promise.race([link, new Promise((r) => setTimeout(() => r(""), LINK_WAIT))])
   if (!url) {
     child.kill()
     if (own) rmSync(home, { recursive: true, force: true })
-    throw new Error("grok login gave no link to open")
+    // what it said last is why: where x.ai is out of reach without a
+    // proxy, it says it couldn't reach it (𝕏 on Discord)
+    const why = tail.at(-1)
+    throw new Error(why ? `grok login gave no link to open: ${why}` : "grok login gave no link to open and said nothing: can this machine reach auth.x.ai? Set a proxy in magpie's Settings if it needs one")
   }
   return {
     url,
@@ -451,6 +464,57 @@ async function usage(key) {
   return { windows: out }
 }
 
+// ---- rate limit -------------------------------------------------------------------
+
+// Grok's billing says nothing of a plan's rate limit: a free account's
+// credits read 0% used while every request comes back 429. So the account's
+// last 429 is kept here, by its CLI home, and usage shows a "Rate limit"
+// window spent until the reset the 429 named (Retry-After, or a
+// *ratelimit*reset* header), or, when it named none, until a request goes
+// through or HOLD_MS has passed. Aside: magpie's gateway already rests an
+// account that answered 429; this is only what the card says.
+const HOLD_MS = 5 * 60_000
+const limited = new Map()
+
+// resetOf is when a 429 says the limit lifts, in ms since the epoch, or 0.
+function resetOf(headers, now) {
+  const ra = headers.get("retry-after")
+  if (ra) {
+    const n = Number(ra)
+    if (Number.isFinite(n) && n >= 0) return now + n * 1000
+    const d = Date.parse(ra)
+    if (!Number.isNaN(d)) return d
+  }
+  for (const [k, v] of headers) {
+    if (!/ratelimit.*reset/i.test(k)) continue
+    const n = Number(v)
+    if (!Number.isFinite(n) || n < 0) continue
+    // a time (epoch ms or seconds) or seconds from now
+    if (n > 1e12) return n
+    if (n > 1e9) return n * 1000
+    return now + n * 1000
+  }
+  return 0
+}
+
+// note keeps what a request's answer says of the rate limit.
+function note(home, res, now = Date.now()) {
+  if (res.status === 429) limited.set(home, { at: now, until: resetOf(res.headers, now) })
+  else if (res.ok) limited.delete(home)
+}
+
+// rateWindow is the window a recent 429 makes, or none.
+function rateWindow(home, now = Date.now()) {
+  const l = limited.get(home)
+  if (!l) return []
+  if (l.until ? l.until <= now : now - l.at >= HOLD_MS) {
+    limited.delete(home)
+    return []
+  }
+  const end = l.until || l.at + HOLD_MS
+  return [{ name: "Rate limit", used: 100, resetsAt: new Date(end).toISOString(), aside: true }]
+}
+
 // kept is res saying magpie is to leave the account's sign-in be.
 function kept(res) {
   const headers = new Headers(res.headers)
@@ -540,7 +604,9 @@ export const GrokAuthPlugin = async ({ client }) => {
             // sent once, as the built-in sent it: Grok's answer goes on as
             // it came, the account kept, as the built-in never marked a Grok
             // account lapsed nor cleared one
-            return kept(await fetch(req.url, { ...init, method: req.method, headers, body }))
+            const res = await fetch(req.url, { ...init, method: req.method, headers, body })
+            note(home, res)
+            return kept(res)
           },
         }
       },
@@ -569,7 +635,9 @@ export const GrokAuthPlugin = async ({ client }) => {
           return { error: e.message, windows: [], signIn: "kept" }
         }
         await remember(auth, c)
-        return { ...(await usage(c.key)), signIn: "kept" }
+        const u = await usage(c.key)
+        if (!u.error) u.windows = [...rateWindow(auth.refresh), ...u.windows]
+        return { ...u, signIn: "kept" }
       },
     },
 
@@ -609,4 +677,4 @@ export const GrokAuthPlugin = async ({ client }) => {
 }
 
 // for tests
-export const _internal = { rewrite, bodyText }
+export const _internal = { rewrite, bodyText, limited, HOLD_MS }

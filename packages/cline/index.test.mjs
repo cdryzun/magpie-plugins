@@ -3,7 +3,7 @@
 import { test, expect, beforeEach, afterEach } from "bun:test"
 import { ClinePlugin, _internal } from "./index.mjs"
 
-const { authOf, parseAuth, parseFeed, prettify, balanceOf, balanceWindow, usd, usageOf, failure, bearerOf, toMs, refresh, deviceAuthorize, pollDevice, clientHeaders, constants: { CLIENT, DEFAULT_MODELS } } = _internal
+const { authOf, parseAuth, parseFeed, prettify, balanceOf, balanceWindow, usd, usageOf, limitWindows, failure, bearerOf, toMs, refresh, deviceAuthorize, pollDevice, clientHeaders, constants: { CLIENT, DEFAULT_MODELS } } = _internal
 
 // ---- a fetch that answers from a script -----------------------------------------
 
@@ -556,6 +556,48 @@ test("usage reads the account's balance", async () => {
 	expect(out.windows[0].name).toBe("Credits")
 	expect(out.windows[0].used).toBeCloseTo(25)
 	expect(out.windows[0].display).toBe("250 / 1000")
+})
+
+test("usage reads ClinePass's 5-hour, weekly and monthly limits", async () => {
+	const { client: c } = client()
+	const hooks = await ClinePlugin({ client: c })
+	serve([
+		["/users/me/plan/usage-limits", () => Response.json({ success: true, data: { limits: [
+			{ type: "monthly", percentUsed: 12.5, resetsAt: "2026-11-01T00:00:00.000Z" },
+			{ type: "five_hour", percentUsed: 40, resetsAt: "2026-10-05T15:00:00.000Z" },
+			{ type: "weekly", percentUsed: 130 },
+		] } })],
+		["/users/me", () => Response.json({ success: true, data: { clineUserId: "cu1" } })],
+		["/users/cu1/balance", () => Response.json({ success: true, data: { balance: 25000000 } })],
+	])
+	const out = await hooks.auth.usage(async () => ({ type: "api", key: "ck" }))
+	expect(out.windows).toEqual([
+		{ name: "5 hours", used: 40, span: 18000, resetsAt: "2026-10-05T15:00:00.000Z" },
+		{ name: "Weekly", used: 100, span: 604800 },
+		{ name: "Month", used: 12.5, span: 2592000, resetsAt: "2026-11-01T00:00:00.000Z" },
+		{ name: "Credits", used: 0, display: "$25.00 left" },
+	])
+	const limits = calls.find((x) => x.url.endsWith("/users/me/plan/usage-limits"))
+	expect(limits.init.headers.Authorization).toBe("Bearer ck")
+})
+
+test("an account whose limits can't be read keeps its balance and its sign-in", async () => {
+	const { client: c } = client()
+	const hooks = await ClinePlugin({ client: c })
+	serve([
+		["/users/me/plan/usage-limits", () => Response.json({ success: false, error: "no active plan" }, { status: 403 })],
+		["/users/me", () => Response.json({ success: true, data: { clineUserId: "cu1" } })],
+		["/users/cu1/balance", () => Response.json({ success: true, data: { balance: 1000000 } })],
+	])
+	const out = await hooks.auth.usage(async () => ({ type: "api", key: "ck" }))
+	expect(out.signIn).toBe("kept")
+	expect(out.error).toBeUndefined()
+	expect(out.windows).toEqual([{ name: "Credits", used: 0, display: "$1.00 left" }])
+})
+
+test("limitWindows leaves out what it doesn't know", () => {
+	expect(limitWindows(null)).toEqual([])
+	expect(limitWindows({ limits: [{ type: "daily", percentUsed: 5 }, { type: "five_hour" }] })).toEqual([{ name: "5 hours", used: 0, span: 18000 }])
 })
 
 test("usage tries the ids users/me names, in order", async () => {

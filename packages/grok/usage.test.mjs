@@ -111,6 +111,60 @@ test("a model list Grok couldn't give fails, not falls back to the configured fe
   await expect(hooks.provider.models({ id: "grok", models: { "grok-4.7": { id: "grok-4.7" } } }, { auth })).rejects.toThrow()
 })
 
+// a free account's billing reads 0% used while its requests are 429'd
+// (H20 on Discord): the 429 is what the card shows, until it lifts
+test("a request answered 429 shows a spent Rate limit window until its reset", async () => {
+  const billing = () => Response.json({ config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-10-12T02:17:59Z" } } })
+  const week = { name: "7 days", used: 0, span: 604800, resetsAt: "2026-10-12T02:17:59Z" }
+  const hooks = await GrokAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const opts = await hooks.auth.loader(async () => auth)
+  const send = async (res) => {
+    globalThis.fetch = async () => res
+    return opts.fetch("https://cli-chat-proxy.grok.com/v1/responses", { method: "POST", body: JSON.stringify({ model: "grok-4.7", input: "hi" }) })
+  }
+  const card = async () => {
+    globalThis.fetch = async () => billing()
+    return (await hooks.auth.usage(async () => auth)).windows
+  }
+  expect(await card()).toEqual([week])
+
+  // Retry-After in seconds
+  const t0 = Date.now()
+  expect((await send(new Response("You've hit the rate limit for your plan.", { status: 429, headers: { "Retry-After": "120" } }))).status).toBe(429)
+  let ws = await card()
+  expect(ws.length).toBe(2)
+  expect(ws[0]).toMatchObject({ name: "Rate limit", used: 100, aside: true })
+  const at = Date.parse(ws[0].resetsAt)
+  expect(at).toBeGreaterThanOrEqual(t0 + 119_000)
+  expect(at).toBeLessThanOrEqual(Date.now() + 121_000)
+  expect(ws[1]).toEqual(week)
+
+  // a request that goes through lifts it
+  await send(Response.json({ ok: true }))
+  expect(await card()).toEqual([week])
+
+  // a reset header in epoch seconds
+  const reset = Math.floor(Date.now() / 1000) + 600
+  await send(new Response("", { status: 429, headers: { "x-ratelimit-reset-requests": String(reset) } }))
+  expect((await card())[0]).toMatchObject({ name: "Rate limit", resetsAt: new Date(reset * 1000).toISOString() })
+
+  // a reset passed is gone; none named holds HOLD_MS from the 429
+  const { limited, HOLD_MS } = _internal
+  limited.get(home).until = Date.now() - 1
+  expect(await card()).toEqual([week])
+  await send(new Response("", { status: 429 }))
+  ws = await card()
+  expect(Date.parse(ws[0].resetsAt) - limited.get(home).at).toBe(HOLD_MS)
+  limited.get(home).at -= HOLD_MS
+  expect(await card()).toEqual([week])
+
+  // another answer that failed leaves it as it was
+  await send(new Response("", { status: 429 }))
+  await send(new Response("", { status: 500 }))
+  expect((await card())[0].name).toBe("Rate limit")
+  limited.clear()
+})
+
 test("a body in bytes is reshaped as a string one is", () => {
   const { rewrite, bodyText } = _internal
   const chat = { model: "grok-4.7", tools: [{ type: "function", name: "f" }, { type: "custom", name: "apply_patch" }] }

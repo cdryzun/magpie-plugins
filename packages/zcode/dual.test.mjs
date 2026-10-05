@@ -1,10 +1,10 @@
 // A dual account (a GLM Coding Plan and gift plans) shows both allowances on
-// its card and spends the gift first: a request for a model the gift serves
-// goes to the Start Plan, dressed as ZCode's; when the gift says it is spent
-// the same request is replayed once to the coding plan, undressed, and that
-// model keeps to the coding plan for a minute. Anything else the gift says
-// (its 405, its "unusual activity") stands as the answer. Nothing leaves the
-// machine: the plugin's fetch is the fake here.
+// its card. A plain model always spends the coding plan; the gift is spent
+// only through its trial entries (GLM-5.3-Flash-Trial), the user's pick. A
+// trial entry whose bucket is spent or blocked answers 429 locally; the
+// gift's own quota answers (its 1113, its 1005 inside a 200) become 429 and
+// keep the entry off for a minute, while any other gift answer goes on as it
+// came. Nothing leaves the machine: the plugin's fetch is the fake here.
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { homedir, tmpdir } from "node:os"
 import { realpathSync } from "node:fs"
@@ -63,6 +63,134 @@ async function sendTo(url, body) {
 const MSG = "https://api.z.ai/api/anthropic/v1/messages"
 const body = (model) => JSON.stringify({ model, max_tokens: 100, messages: [{ role: "user", content: "hi" }] })
 
+for (const [name, paid, gift] of [
+  ["a full paid week leaves an available gift usable", 100, 25],
+  ["a spent gift leaves the paid plan usable", 20, 100],
+  ["two available pools keep their windows apart", 20, 25],
+  ["two spent pools keep the paid limit visible", 100, 100],
+]) {
+  test(name, async () => {
+    planAndBalance()
+    answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: paid }] })
+    answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, balances: [{ ...balance.balances[0], used_units: gift * 10, remaining_units: 1000 - gift * 10 }] })
+    answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+    answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+    const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+    expect(u.windows[0].used).toBe(paid)
+    expect(u.windows[1].used).toBe(gift)
+    expect(u.windows[0].notModels).toEqual(["glm-5.3-flash-trial"])
+    expect(u.windows[1].models).toEqual(["GLM-5.3-Flash-Trial"])
+    expect(JSON.stringify(u)).not.toContain("_spent")
+    // a plain model spends the coding plan whatever the gift holds
+    let before = sent.length
+    expect((await sendTo(MSG, body("GLM-5.3-Flash"))).status).toBe(200)
+    expect(sent.slice(before).at(-1).origin).toBe("https://api.z.ai")
+    expect(sent.slice(before).filter((c) => c.path.endsWith("/messages"))).toHaveLength(1)
+    // the trial entry spends the gift while it has quota, and nothing else
+    before = sent.length
+    const t = await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
+    if (gift < 100) {
+      expect(t.status).toBe(200)
+      expect(sent.slice(before).at(-1).origin).toBe("https://zcode.z.ai")
+    } else {
+      expect(t.status).toBe(429)
+      expect(sent.slice(before).filter((c) => c.path.endsWith("/messages"))).toHaveLength(0)
+    }
+  })
+}
+
+test("a spent gift retires its trial entry from the request cache", async () => {
+  planAndBalance()
+  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 20 }] })
+  answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  await sendTo(MSG, body("GLM-5.3-Flash-Trial")) // warms the ten-minute request cache
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, balances: [{ ...balance.balances[0], used_units: 1000, remaining_units: 0 }] })
+  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  expect(u.windows[1].models).toEqual(["GLM-5.3-Flash-Trial"])
+  const before = sent.length
+  expect((await sendTo(MSG, body("GLM-5.3-Flash-Trial"))).status).toBe(429)
+  expect(sent.slice(before).filter((c) => c.path.endsWith("/messages"))).toHaveLength(0)
+})
+
+test("fresh usage recognizes a newly replenished gift without waiting for the request cache", async () => {
+  planAndBalance()
+  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 100 }] })
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, balances: [{ ...balance.balances[0], used_units: 1000, remaining_units: 0 }] })
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  await sendTo(MSG, body("GLM-5.3-Flash-Trial")) // refused locally, the bucket spent
+  answers["/api/v1/zcode-plan/billing/balance"] = ok(balance)
+  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  expect(u.windows[0].notModels).toEqual(["glm-5.3-flash-trial"])
+  const before = sent.length
+  expect((await sendTo(MSG, body("GLM-5.3-Flash-Trial"))).status).toBe(200)
+  expect(sent.slice(before).at(-1).origin).toBe("https://zcode.z.ai")
+})
+
+test("an expired gift restores the paid windows and retires its cached route", async () => {
+  planAndBalance()
+  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 20 }] })
+  answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  await sendTo(MSG, body("glm-5.3-flash"))
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, plans: [{ ...balance.plans[0], ends_at: now - 1 }] })
+  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  expect(u.windows).toHaveLength(1)
+  expect(u.windows[0].notModels).toBeUndefined()
+  const before = sent.length
+  await sendTo(MSG, body("glm-5.3-flash"))
+  expect(sent.slice(before).at(-1).origin).toBe("https://api.z.ai")
+})
+
+test("a trial entry's quota refusal answers 429 and blocks the entry for a minute", async () => {
+  planAndBalance()
+  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 100 }] })
+  answers["/api/v1/zcode-plan/anthropic/v1/messages"] = new Response(JSON.stringify({ code: "1005", msg: "exceed quota limit" }), { headers: { "content-type": "application/json" } })
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  expect((await sendTo(MSG, body("GLM-5.3-Flash-Trial"))).status).toBe(429)
+  expect(sent.filter((c) => c.origin === "https://api.z.ai" && c.path.endsWith("/messages"))).toHaveLength(0)
+  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  expect(u.windows[0].notModels).toEqual(["glm-5.3-flash-trial"])
+  expect(u.windows[1].models).toEqual(["GLM-5.3-Flash-Trial"])
+  _internal.blocked.clear()
+  const renewed = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  expect(renewed.windows[0].notModels).toEqual(["glm-5.3-flash-trial"])
+  expect(renewed.windows[1].aside).not.toBe(true)
+})
+
+test("blocking one model leaves another model of the same gift bucket usable", async () => {
+  planAndBalance()
+  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 100 }] })
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, balances: [{ ...balance.balances[0], capabilities: ["model:glm-5.3-flash", "model:GLM-5.2"] }] })
+  _internal.blocked.set(KEY + "\0" + jwt + "\0glm-5.3-flash", Date.now() + 60_000)
+  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  expect(u.windows[0].notModels).toEqual(["glm-5.3-flash-trial", "glm-5.2-trial"])
+  expect(u.windows[1].models).toEqual(["GLM-5.3-Flash-Trial", "GLM-5.2-Trial"])
+  expect(u.windows[1].aside).not.toBe(true)
+})
+
+test("a spent bucket without remaining_units is skipped using its used and total counts", async () => {
+  planAndBalance()
+  const spent = { ...balance.balances[0], used_units: "1000", total_units: "1000" }
+  delete spent.remaining_units
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, balances: [spent] })
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  await sendTo(MSG, body("glm-5.3-flash"))
+  expect(sent.at(-1).origin).toBe("https://api.z.ai")
+  expect(sent.filter((c) => c.path === "/api/v1/zcode-plan/anthropic/v1/messages")).toHaveLength(0)
+})
+
+test("a spent gift-only account keeps its spent window as a routing limit", async () => {
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({ ...balance, balances: [{ ...balance.balances[0], used_units: 1000, remaining_units: 0 }] })
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ site: "zai", base: "https://api.z.ai/api/anthropic", jwt, device: DEVICE }), expires: 0 }
+  const u = await (await hooks()).usage(async () => only, { id: "zcode" })
+  expect(u.windows[0].used).toBe(100)
+  expect(u.windows[0].aside).toBeUndefined()
+  expect(JSON.stringify(u)).not.toContain("_spent")
+})
+
+
 test("the card shows the Coding windows and the gift's buckets together", async () => {
   planAndBalance()
   answers["/api/monitor/usage/quota/limit"] = ok({ level: "pro", limits: [{ type: "CREDIT_LIMIT", unit: 3, number: 5, usage: 2000, remaining: 1500, percentage: 25 }] })
@@ -70,30 +198,11 @@ test("the card shows the Coding windows and the gift's buckets together", async 
   expect(u.plan).toBe("GLM Coding Pro")
   expect(u.signIn).toBe("kept")
   expect(u.error).toBeUndefined()
-  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "Start Plan · Trust Build"])
-  expect(u.windows[1]).toMatchObject({ used: 25, display: "250 / 1000", models: ["glm-5.3-flash"] })
-  // shown, but set aside: spending the gift must not bench the account,
-  // since the coding plan serves the same model (the fetch hook replays
-  // a spent gift to it)
-  expect(u.windows[1].aside).toBe(true)
+  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "Trust Build"])
+  expect(u.windows[1]).toMatchObject({ used: 25, display: "250 / 1000", models: ["GLM-5.3-Flash-Trial"] })
   expect(u.until).toBeUndefined()
   expect(u.renew).toBeUndefined()
   expect(u.windows[1].resetsAt).toBe(new Date((now + 3600) * 1000).toISOString())
-})
-
-test("a spent gift window stays on the card, aside, so the account is not benched", async () => {
-  answers["/api/biz/subscription/list"] = ok([{ productName: "GLM Coding Pro", status: "VALID" }])
-  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 97 }] })
-  answers["/api/v1/zcode-plan/billing/balance"] = ok({
-    server_time: now,
-    plans: [{ plan_id: "zai-start-plan", user_plan_id: "up1", name: "Start Plan", status: "active", ends_at: now + 86400,
-      entitlements: [{ entitlement_id: "e1", period: "daily" }] }],
-    balances: [{ plan_id: "zai-start-plan", user_plan_id: "up1", entitlement_id: "e1", show_name: "Trust Build", capabilities: ["model:glm-5.3-flash"],
-      total_units: 100000000, used_units: 100000000, remaining_units: 0, expires_at: now + 3600 }],
-  })
-  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
-  const gift = u.windows.find((w) => w.name === "Start Plan · Trust Build")
-  expect(gift).toMatchObject({ used: 100, aside: true })
 })
 
 test("a gift read that fails after the gift was known leaves just the Coding card", async () => {
@@ -105,12 +214,18 @@ test("a gift read that fails after the gift was known leaves just the Coding car
   const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
   expect(u.windows.map((w) => w.name)).toEqual(["5 hours"])
   expect(u.error).toBeUndefined()
+  expect(_internal.routes.get(KEY + "\0" + jwt).gift).toBeNull()
+  expect(_internal.routes.get(KEY + "\0" + jwt).ttl).toBe(60_000)
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  const before = sent.length
+  await sendTo(MSG, body("glm-5.3-flash"))
+  expect(sent.slice(before).at(-1).origin).toBe("https://api.z.ai")
 })
 
-test("a model the gift serves goes to the Start Plan, dressed", async () => {
+test("a trial entry goes to the Start Plan, dressed", async () => {
   planAndBalance()
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
-  const res = await sendTo(MSG, body("glm-5.3-flash"))
+  const res = await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
   expect(res.status).toBe(200)
   expect(sent.length).toBe(3) // the plan list and the balance read, then the message
   const m = sent.at(-1)
@@ -120,6 +235,7 @@ test("a model the gift serves goes to the Start Plan, dressed", async () => {
   expect(m.headers.authorization).toBe("Bearer " + jwt)
   expect(m.headers["x-api-key"]).toBeUndefined()
   expect(JSON.parse(m.body).system.length).toBeGreaterThan(1) // dressed
+  expect(JSON.parse(m.body).model).toBe("glm-5.3-flash") // the entry's own model
 })
 
 test("a model the gift does not serve goes to the coding plan as sent", async () => {
@@ -135,54 +251,49 @@ test("a model the gift does not serve goes to the coding plan as sent", async ()
   expect(m.headers["x-title"]).toBeUndefined()
 })
 
-test("a spent gift replays the request once to the coding plan, undressed", async () => {
+test("a spent bucket answers the trial entry 429 without touching the coding plan", async () => {
   planAndBalance()
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = new Response(JSON.stringify({ error: { code: "1113", message: "Insufficient balance or no resource package" } }), { status: 429 })
   answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
-  const res = await sendTo(MSG, body("glm-5.3-flash"))
-  expect(res.status).toBe(200)
-  const m = sent.at(-1)
-  expect(m.origin).toBe("https://api.z.ai")
-  expect(m.body).toBe(body("glm-5.3-flash")) // the agent's body, not dressed
-  expect(m.headers["x-api-key"]).toBe(KEY)
-  // the second try for the same model skips the gift: kept off for a minute
+  const res = await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
+  expect(res.status).toBe(429)
+  expect(sent.filter((c) => c.origin === "https://api.z.ai" && c.path.endsWith("/messages"))).toHaveLength(0)
+  // the minute's block keeps the next one off the gift too
   const before = sent.length
-  await sendTo(MSG, body("glm-5.3-flash"))
-  expect(sent.slice(before).at(-1).origin).toBe("https://api.z.ai")
+  await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
+  expect(sent.slice(before).filter((c) => c.path.endsWith("/messages"))).toHaveLength(0)
 })
 
-test("a gift's 200 with a quota error replays to the coding plan too", async () => {
+test("a trial entry's quota error inside a 200 becomes 429", async () => {
   planAndBalance()
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = new Response(JSON.stringify({ code: 1005, msg: "exceed quota limit", logid: "x" }), { status: 200, headers: { "content-type": "application/json" } })
   answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
-  const res = await sendTo(MSG, body("glm-5.3-flash"))
-  expect(res.status).toBe(200)
-  const m = sent.at(-1)
-  expect(m.origin).toBe("https://api.z.ai")
-  expect(m.body).toBe(body("glm-5.3-flash"))
+  const res = await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
+  expect(res.status).toBe(429)
+  expect(sent.filter((c) => c.origin === "https://api.z.ai" && c.path.endsWith("/messages"))).toHaveLength(0)
 })
 
-test("a gift's 200 success answers normally: no replay", async () => {
+test("a trial entry's 200 success answers normally: no replay", async () => {
   planAndBalance()
   const sse = new Response("data: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = sse
-  const res = await sendTo(MSG, body("glm-5.3-flash"))
+  const res = await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
   expect(res.status).toBe(200)
   expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
   expect(sent.filter((c) => c.path === "/api/anthropic/v1/messages").length).toBe(0)
   expect(await res.text()).toBe("data: {}\n\n")
 })
 
-test("a gift refusal replays to the coding plan but keeps the gift unblocked", async () => {
+test("a gift refusal answers the trial entry as it came, unblocked", async () => {
   planAndBalance()
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = new Response(JSON.stringify({ code: "3012", msg: "unusual activity" }), { status: 405 })
   answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
-  const res = await sendTo(MSG, body("glm-5.3-flash"))
-  expect(res.status).toBe(200)
-  expect(sent.at(-1).origin).toBe("https://api.z.ai")
+  const res = await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
+  expect(res.status).toBe(405)
+  expect(sent.filter((c) => c.origin === "https://api.z.ai" && c.path.endsWith("/messages"))).toHaveLength(0)
   expect(_internal.blocked.size).toBe(0)
   const before = sent.length
-  await sendTo(MSG, body("glm-5.3-flash"))
+  await sendTo(MSG, body("GLM-5.3-Flash-Trial"))
   expect(sent.slice(before).some((c) => c.origin === "https://zcode.z.ai")).toBe(true)
 })
 
@@ -252,11 +363,11 @@ test("every live plan spends first by its buckets' models, and the card shows th
   })
   answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = ok({ type: "message", content: [] })
-  // models of both live plans go to the gift first
-  for (const m of ["glm-5.3-flash", "GLM-5.2"]) {
+  // plain models stay on the coding plan; the trial entries spend the gift
+  for (const [m, origin] of [["glm-5.3-flash", "https://api.z.ai"], ["GLM-5.2", "https://api.z.ai"], ["GLM-5.3-Flash-Trial", "https://zcode.z.ai"], ["GLM-5.2-Trial", "https://zcode.z.ai"]]) {
     const before = sent.length
     expect((await sendTo(MSG, body(m))).status).toBe(200)
-    expect(sent.slice(before).at(-1).origin).toBe("https://zcode.z.ai")
+    expect(sent.slice(before).at(-1).origin).toBe(origin)
   }
   // the ended plan's bucket does not put GLM-4 on the gift
   const before = sent.length
@@ -264,8 +375,10 @@ test("every live plan spends first by its buckets' models, and the card shows th
   expect(sent.slice(before).at(-1).origin).toBe("https://api.z.ai")
   // the card shows both plans' live buckets, spent ones included, none of the ended plan's
   const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
-  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "Start Plan · Trust Build", "GLM Festival Grant · GLM-5.2", "GLM Festival Grant · GLM-5.2 late"])
+  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "Trust Build", "GLM-5.2-Trial", "GLM-5.2 late"])
   expect(u.windows.some((w) => w.name === "Old")).toBe(false)
+  expect(u.windows[0].notModels).toEqual(["glm-5.3-flash-trial", "glm-5.2-trial"])
+  expect(u.windows.at(-1).aside).toBe(true) // a spent sibling cannot cap a live bucket
 })
 
 test("a gift-only account sends every request to the gift, and reads no balance to do it", async () => {
