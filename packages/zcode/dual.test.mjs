@@ -72,9 +72,28 @@ test("the card shows the Coding windows and the gift's buckets together", async 
   expect(u.error).toBeUndefined()
   expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "Start Plan · Trust Build"])
   expect(u.windows[1]).toMatchObject({ used: 25, display: "250 / 1000", models: ["glm-5.3-flash"] })
+  // shown, but set aside: spending the gift must not bench the account,
+  // since the coding plan serves the same model (the fetch hook replays
+  // a spent gift to it)
+  expect(u.windows[1].aside).toBe(true)
   expect(u.until).toBeUndefined()
   expect(u.renew).toBeUndefined()
   expect(u.windows[1].resetsAt).toBe(new Date((now + 3600) * 1000).toISOString())
+})
+
+test("a spent gift window stays on the card, aside, so the account is not benched", async () => {
+  answers["/api/biz/subscription/list"] = ok([{ productName: "GLM Coding Pro", status: "VALID" }])
+  answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 97 }] })
+  answers["/api/v1/zcode-plan/billing/balance"] = ok({
+    server_time: now,
+    plans: [{ plan_id: "zai-start-plan", user_plan_id: "up1", name: "Start Plan", status: "active", ends_at: now + 86400,
+      entitlements: [{ entitlement_id: "e1", period: "daily" }] }],
+    balances: [{ plan_id: "zai-start-plan", user_plan_id: "up1", entitlement_id: "e1", show_name: "Trust Build", capabilities: ["model:glm-5.3-flash"],
+      total_units: 100000000, used_units: 100000000, remaining_units: 0, expires_at: now + 3600 }],
+  })
+  const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  const gift = u.windows.find((w) => w.name === "Start Plan · Trust Build")
+  expect(gift).toMatchObject({ used: 100, aside: true })
 })
 
 test("a gift read that fails after the gift was known leaves just the Coding card", async () => {

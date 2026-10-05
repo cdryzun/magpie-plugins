@@ -88,7 +88,10 @@ and end. The card's plan and term stay the coding plan's. A gift read
 that fails leaves just the coding card — magpie hides a card's windows
 behind an error, so a gift hiccup must not black out a working Coding
 Plan. A gift that goes out of date while requests use it simply stops
-showing.
+showing. Every gift window is set aside for routing: magpie shows it on
+the card but never benches the account over it, because the coding plan
+serves the same model — a spent gift just sends that model back to the
+coding plan.
 
 ## Models
 

@@ -524,6 +524,10 @@ async function startUsage(s) {
 // gift read that fails leaves just the Coding card: magpie hides a card's
 // windows behind an error and leaves it out of the menu bar and auto-switch,
 // so erroring here would hide a working Coding Plan over a gift hiccup.
+// Every gift window is set aside (aside: true): magpie shows it on the card
+// but never benches the account over it. Spending the gift stops the gift,
+// not the account — the coding plan serves the same model, and the request
+// path replays a spent gift to it (see the fetch hook).
 async function dualUsage(s) {
   const out = await codingUsage(s)
   try {
@@ -531,7 +535,8 @@ async function dualUsage(s) {
     if (g) out.windows = [...out.windows, ...g.windows.map((w) => {
       const p = w._plan
       delete w._plan
-      return p && p !== w.name ? { ...w, name: p + " · " + w.name } : w
+      const named = p && p !== w.name ? { ...w, name: p + " · " + w.name } : w
+      return { ...named, aside: true }
     })]
   } catch {}
   return out
