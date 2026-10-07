@@ -25,13 +25,15 @@ const ok = (data) => new Response(JSON.stringify({ code: 0, data }), { headers: 
 const message = (text) => Response.json({ type: "message", role: "assistant", content: [{ type: "text", text }] })
 
 const sent = []
-let balance, startReply
+let balance, startReply, codingReply, preview
 const real = globalThis.fetch
 beforeEach(() => {
   internal.routes.clear()
   internal.blocked.clear()
   sent.length = 0
   startReply = () => message("START")
+  codingReply = () => message("CODING")
+  preview = { plans: [] }
   balance = {
     server_time: now,
     plans: [{ plan_id: "zai-start-plan", user_plan_id: "u1", name: "Start Plan", status: "active", ends_at: now + 86400, entitlements: [{ entitlement_id: "e1", period: "daily" }] }],
@@ -41,21 +43,22 @@ beforeEach(() => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     const text = init.body ?? (input instanceof Request ? await input.text() : undefined)
     if (url.pathname === "/api/biz/subscription/list") return ok([{ status: "VALID", productName: "GLM Coding Max", autoRenew: true }])
-    if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 10 }] })
+    if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, usage: 2000, remaining: 1800, percentage: 10 }] })
     if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(balance)
+    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(preview)
     if (url.pathname.endsWith("/messages")) {
       sent.push({ origin: url.origin, path: url.pathname, headers: Object.fromEntries(new Headers(init.headers ?? {})), body: text })
-      return url.origin === "https://zcode.z.ai" ? startReply() : message("CODING")
+      return url.origin === "https://zcode.z.ai" ? startReply() : codingReply()
     }
     throw new Error("unmocked request: " + url.pathname)
   }
 })
 afterEach(() => { globalThis.fetch = real })
 
-const call = async (model = "GLM-5.3-Flash") => {
+const call = async (model = "GLM-5.3-Flash", options = {}) => {
   const hooks = await fork.default({})
   const loader = await hooks.auth.loader(async () => auth, { id: "zcode" })
-  const res = await loader.fetch(CODING_MSG, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...JSON.parse(body), model }) })
+  const res = await loader.fetch(CODING_MSG, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...JSON.parse(body), model }), ...options })
   return { res, json: await res.clone().json().catch(() => null) }
 }
 
@@ -118,4 +121,73 @@ test("a 400 from Start is the answer, not a second request", async () => {
   const { res } = await call()
   expect(res.status).toBe(400)
   expect(sent.filter((r) => r.path.endsWith("/messages")).length).toBe(1)
+})
+
+const usage = async () => {
+  const hooks = await fork.default({})
+  return hooks.auth.usage(async () => auth, { id: "zcode" })
+}
+
+test("Start-first usage keeps numeric counts and scopes the two allowances", async () => {
+  const card = await usage()
+  const [coding, start] = card.windows
+  expect([coding.used, coding.amount, coding.limit]).toEqual([10, 200, 2000])
+  expect(coding.notModels).toContain("glm-5.3-flash")
+  expect([start.used, start.amount, start.limit]).toEqual([25, 250, 1000])
+  expect(start.models).toContain("GLM-5.3-Flash")
+})
+
+test("a cooling Start stays visible while Coding counts the plain Flash model", async () => {
+  startReply = () => Response.json({ error: { message: "exceed quota limit" } }, { status: 429 })
+  await call()
+  const card = await usage()
+  expect(card.windows[0].notModels).not.toContain("glm-5.3-flash")
+  expect(card.windows[1].models).toEqual(["GLM-5.3-Flash-Trial"])
+  expect([card.windows[1].amount, card.windows[1].limit]).toEqual([250, 1000])
+  sent.length = 0
+  expect((await call()).json.content[0].text).toBe("CODING")
+  expect(sent).toHaveLength(1)
+})
+
+test("an exhausted Start stays visible and no longer excludes Coding Flash", async () => {
+  balance.balances[0] = { ...balance.balances[0], used_units: 1000, remaining_units: 0 }
+  const card = await usage()
+  expect(card.windows[0].notModels).not.toContain("glm-5.3-flash")
+  expect([card.windows[1].used, card.windows[1].amount, card.windows[1].limit]).toEqual([100, 1000, 1000])
+})
+
+test("Start-first usage includes the upstream claim hint outside the allowances", async () => {
+  preview = { plans: [{ plan_id: "next-gift", name: "ZCode Trust Build" }] }
+  const card = await usage()
+  expect(card.windows.at(-1)).toEqual({
+    name: "ZCode Trust Build", used: 0, aside: true, display: "1 to claim · claim it in the ZCode app",
+  })
+  expect(card.windows[1].models).toContain("GLM-5.3-Flash")
+})
+
+test("an unreachable Start replays Coding only once even when Coding is limited", async () => {
+  startReply = () => { throw new TypeError("Start connection failed") }
+  codingReply = () => Response.json({ error: { message: "exceed quota limit" } }, { status: 429 })
+  const { res } = await call()
+  expect(res.status).toBe(429)
+  expect(sent).toHaveLength(2)
+  expect(sent[1].origin).toBe("https://api.z.ai")
+})
+
+test("a Coding quota error is not replayed after Start already fell back", async () => {
+  startReply = () => Response.json({ error: { message: "exceed quota limit" } }, { status: 429 })
+  codingReply = () => Response.json({ code: "1005", message: "exceed quota limit" })
+  const { json } = await call()
+  expect(json.code).toBe("1005")
+  expect(sent).toHaveLength(2)
+})
+
+test("a cancelled Start request never replays Coding", async () => {
+  const controller = new AbortController()
+  startReply = () => {
+    controller.abort()
+    throw new DOMException("The request was aborted", "AbortError")
+  }
+  await expect(call("GLM-5.3-Flash", { signal: controller.signal })).rejects.toThrow("The request was aborted")
+  expect(sent).toHaveLength(1)
 })

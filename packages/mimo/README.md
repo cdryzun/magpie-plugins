@@ -41,6 +41,17 @@ as magpie's built-in MiMo account did; reading usage renews the session once
 when the server turns it away. If the passToken no longer works, sign in
 again.
 
+## Usage
+
+magpie's Usage card shows the MiMo app's plan and its week's allowance.
+A Token Plan bought at the open platform (platform.xiaomimimo.com) is a
+plan of its own: its credits are spent by its `tp-` API key at
+`token-plan-<region>.xiaomimimo.com`, not by this account's requests. The
+same passToken signs on at the platform (sid `api-platform`), so the card
+shows the Token Plan too, as its credits beside the week's allowance, and
+as the card's plan when the account has no app plan. To spend the Token
+Plan, add magpie's "Xiaomi MiMo" provider with its `tp-` key.
+
 ## Where the sign-in is kept
 
 In OpenCode's `auth.json`, or magpie's `plugin-auth.json`, as an OAuth sign-in:

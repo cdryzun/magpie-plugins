@@ -97,3 +97,41 @@ test("stepUsage finds the Run's event by its conversation and time, once", async
   expect(await stepUsage("tok", conv, since)).toBe(null)
   expect(asks.length).toBe(1)
 })
+
+// yetone/magpie#1053: a step's count can be owed to a later step of its
+// conversation (ledger); latency.test.mjs runs whole conversations
+test("an account that can't read its events is guessed as before, and owes nothing", async () => {
+  const { ledger, owed, unreadable, misses } = _internal
+  Object.assign(STEP_WAIT, { first: 0, every: 10, until: 60 })
+  const conv = "6b5568d9-0000-4000-8000-000000000003"
+  let asks = 0
+  globalThis.fetch = async () => (asks++, new Response("{}", { status: 403 }))
+  const out = await run([listed, call], { stepUsage: ledger("tok-403", conv, Date.now(), undefined, true).own })
+  expect(out.at(-1).usage.prompt_tokens).toBe(2395)
+  expect(owed.has(conv)).toBe(false)
+  // nor asked again for a while
+  expect(await ledger("tok-403", conv, Date.now(), undefined, true).own()).toBe(null)
+  expect(asks).toBe(1)
+  unreadable.clear()
+  misses.clear()
+})
+
+test("what a Run collected and never gave out goes to the conversation's next step", async () => {
+  const { ledger, owed } = _internal
+  Object.assign(STEP_WAIT, { first: 0, every: 10, until: 60 })
+  const conv = "6b5568d9-0000-4000-8000-000000000004"
+  const since = Date.now()
+  globalThis.fetch = async () =>
+    Response.json({ usageEventsDisplay: [{ timestamp: String(since + 4000), conversationId: conv, tokenUsage: { inputTokens: 2, outputTokens: 621, cacheReadTokens: 63457, cacheWriteTokens: 3081 } }] })
+  owed.set(conv, { since, n: 1, ready: since, carry: null })
+  // the Run collects the debt, then fails before its step is counted
+  const failed = ledger("tok", conv, Date.now(), undefined, true)
+  await new Promise((r) => setTimeout(r, 30))
+  failed.done()
+  expect(owed.get(conv).carry).toEqual({ input: 2, output: 621, cacheRead: 63457, cacheWrite: 3081, reasoning: 0 })
+  // the next step that ends the turn has it, once
+  const next = ledger("tok", conv, Date.now(), undefined, true)
+  expect(await next.owed(true)).toEqual({ input: 2, output: 621, cacheRead: 63457, cacheWrite: 3081, reasoning: 0 })
+  expect(owed.has(conv)).toBe(false)
+  expect(await ledger("tok", conv, Date.now(), undefined, true).owed(true)).toBe(null)
+})

@@ -953,6 +953,33 @@ async function fetchUsage(site, deviceToken) {
   return env
 }
 
+// CAMPAIGNS is where Qoder lists the account's campaigns — the daily
+// credits among them (actionType CLAIM_BENEFIT) — and claims one
+// (POST …/{id}/claim), as Qoder's client does, on the device token.
+const CAMPAIGNS = "/sash/api/v1/me/campaigns"
+
+// campaignPage: url is the site's campaigns page or a claim under it, which
+// the account's fetch sends as the account rather than as a chat.
+function campaignPage(site, url) {
+  try {
+    const u = new URL(url)
+    return u.origin === new URL(site.openapi).origin && (u.pathname === CAMPAIGNS || /^\/sash\/api\/v1\/me\/campaigns\/[^/]+\/claim$/.test(u.pathname))
+  } catch {
+    return false
+  }
+}
+
+// campaignCall is url asked with the device token; Qoder's answer comes back
+// as it is.
+async function campaignCall(url, method, body, deviceToken, signal) {
+  return fetch(url, {
+    method,
+    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${deviceToken}`, "Cosy-ClientType": "10", "User-Agent": "Qoder" },
+    body: method === "GET" ? undefined : body || "{}",
+    signal: signal ?? AbortSignal.timeout(20_000),
+  })
+}
+
 // refreshDevice trades the device refresh token for a new pair; it rotates
 // too, so the caller saves it.
 async function refreshDevice(site, refresh, chat = false) {
@@ -1174,6 +1201,27 @@ const makePlugin = (site) => async ({ client }) => {
     }
   }
 
+  // campaign is a campaigns page (the daily check-in) asked as the account:
+  // a refused device token is rotated once, as usage does, and asked again
+  const campaign = async (getAuth, input, url, init) => {
+    const body = await bodyText(input, init)
+    let cred
+    try {
+      cred = await fresh(getAuth)
+    } catch (e) {
+      return signedInError(e)
+    }
+    const method = String(init.method ?? input?.method ?? "GET").toUpperCase()
+    try {
+      let res = await campaignCall(url, method, body, cred.deviceToken, init.signal)
+      if (res.status === 401 || res.status === 403) res = await campaignCall(url, method, body, await deviceToken(getAuth, cred.deviceToken), init.signal)
+      return signed(res, renewed(cred))
+    } catch (e) {
+      if (e?.expired) return signedInError(e)
+      return errorResponse({ status: 502, message: e?.message ?? String(e) })
+    }
+  }
+
   const signedInError = (e) =>
     errorResponse({
       status: e instanceof SignInGone ? 401 : 502,
@@ -1244,6 +1292,7 @@ const makePlugin = (site) => async ({ client }) => {
           // every chat completion written as Qoder's own request
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+            if (campaignPage(site, url)) return campaign(getAuth, input, url, init)
             if (!/\/chat\/completions$/.test(new URL(url).pathname))
               return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
@@ -1309,4 +1358,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }
+export const _internal = { campaignPage, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }

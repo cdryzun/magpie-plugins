@@ -3,13 +3,17 @@
 // swe-2 was said to take none, models.dev not knowing Devin's own ids, and
 // agents dropped its images (面条 on magpie's Discord).
 import { afterEach, expect, test } from "bun:test"
-import { realpathSync } from "node:fs"
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
+import { join } from "node:path"
 import { homedir, tmpdir } from "node:os"
 import { DevinAuthPlugin, _internal } from "./index.mjs"
 
 const real = globalThis.fetch
+const path = process.env.PATH
 afterEach(() => {
   globalThis.fetch = real
+  if (process.env.PATH !== path) rmSync(process.env.PATH, { recursive: true, force: true })
+  process.env.PATH = path
   _internal.forgetSaid()
 })
 
@@ -17,6 +21,15 @@ const { PB, parseModelConfigs, listed, familiesOf, SNAPSHOT, SNAPSHOT_IMAGES, wi
 
 const sandboxed = () => {
   if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
+}
+
+// withoutCli takes the devin CLI out of reach: the plugin finds it on PATH
+// (and in ~/.local/bin, which the sandboxed HOME leaves empty), so a machine
+// with the CLI installed would otherwise take the CLI's path
+const withoutCli = () => {
+  sandboxed()
+  process.env.PATH = mkdtempSync(join(tmpdir(), "no-devin-"))
+  for (const p of ["/usr/local/bin/devin", "/opt/homebrew/bin/devin"]) if (existsSync(p)) throw new Error(p + " is the devin CLI: these tests need a machine without it there")
 }
 
 // configs is a GetCliModelConfigsResponse naming each id, with
@@ -62,7 +75,7 @@ test("a family takes images when every variant Devin named says so, a variant as
 })
 
 test("an account's list without the CLI takes what Devin says of images now", async () => {
-  sandboxed()
+  withoutCli()
   const asked = []
   globalThis.fetch = async (url, init) => {
     asked.push({ url: String(url), headers: init.headers, body: new Uint8Array(init.body) })
@@ -89,7 +102,7 @@ test("an account's list without the CLI takes what Devin says of images now", as
 })
 
 test("when Devin can't be asked, the list takes the snapshot's word", async () => {
-  sandboxed()
+  withoutCli()
   globalThis.fetch = async () => new Response("", { status: 503 })
   const given = { "swe-2": { id: "swe-2", capabilities: { attachment: false, input: { text: true, image: false } } } }
   const got = await (await DevinAuthPlugin()).provider.models({ models: given }, { auth: { type: "api", key: "devin-key" } })

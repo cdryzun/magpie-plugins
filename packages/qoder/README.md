@@ -151,6 +151,27 @@ Neither magpie's built-in Qoder CN nor this plugin has been checked against
 every kind of qoder.cn account. If a sign-in or a chat fails, please open
 an issue with the error.
 
+## Daily check-in
+
+Qoder gives credits for a daily claim (the Qoder client's campaign
+`CLAIM_BENEFIT`, 100 Credits a day as reported), on both sites. magpie can
+press it once a day for each account when its Qoder check-in switch is on
+(Settings). It asks these pages through this plugin's fetch (since 0.2.7),
+which sends them as the account, on the device token (`Bearer`,
+`Cosy-ClientType: 10`) as usage is read; a refused device token is
+rotated once and the page asked again.
+
+- **List:** `GET <openapi>/sash/api/v1/me/campaigns`: `campaigns[]` with
+  `campaignId`, `actionType`, `claimStatus` (`CLAIMABLE`, `CLAIMED`),
+  `startAt`, `endAt`, `benefit.amount`.
+- **Claim:** `POST <openapi>/sash/api/v1/me/campaigns/{id}/claim`, body
+  `{}`: `status` `CLAIMED` (or under `data`).
+- `<openapi>` is `openapi.qoder.sh` (Qoder) or `openapi.qoder.com.cn`
+  (Qoder CN). Other pages on those hosts are still refused.
+
+Taken from [wallechfox/qoder-checkin](https://github.com/wallechfox/qoder-checkin),
+which a user reports works. Not yet tried here with a real Qoder account.
+
 ## Not here
 
 - Qoder's usage and quota display.

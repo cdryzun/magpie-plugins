@@ -152,6 +152,71 @@ async function session(creds, base) {
   return { cookies, me: me.data }
 }
 
+// The open platform (platform.xiaomimimo.com) sells the Token Plan, a plan
+// of its own spent with its tp- API key at token-plan-<region>.xiaomimimo.com,
+// not through the app's /route. The same Xiaomi account signs on there as at
+// the MiMo server: a page asked with no session answers 401 with a
+// serviceLogin URL (sid api-platform), which the passToken follows back
+// through the platform's /sts to the page.
+const PLATFORM = "https://platform.xiaomimimo.com"
+
+// platformPage is one of the platform's /api/v1 pages, as {cookies, data}:
+// cookies the session it was read with (given in, else signed on afresh),
+// data the page's; null data is a page the account can't read.
+async function platformPage(creds, path, cookies) {
+  const signal = AbortSignal.timeout(20_000)
+  const url = PLATFORM + "/api/v1" + path
+  const ask = async (c) => {
+    const res = await fetch(url, { headers: c ? { Cookie: c } : {}, redirect: "manual", signal })
+    return { res, text: await res.text() }
+  }
+  const data = (text) => {
+    try {
+      const v = JSON.parse(text)
+      return v?.code === 0 ? (v.data ?? null) : undefined
+    } catch {}
+  }
+  if (cookies) {
+    const { res, text } = await ask(cookieHeader(cookies))
+    const d = res.status === 200 ? data(text) : undefined
+    if (d !== undefined) return { cookies, data: d }
+  }
+  let { res, text } = await ask("")
+  let login
+  try {
+    login = JSON.parse(text)?.loginUrl
+  } catch {}
+  if (res.status !== 401 || typeof login !== "string" || !login.startsWith(ACCOUNT + "/")) {
+    throw new Error(`Xiaomi MiMo platform ${path}: ${vendorError(text, statusLine(res.status))}`)
+  }
+  const jar = new Jar()
+  for (const [k, v] of [["userId", creds.userId], ["passToken", creds.passToken], ["cUserId", creds.cUserId],
+    ["deviceId", creds.deviceId], ["pass_ua", "pc"], ["uLocale", "zh_CN"]]) {
+    if (v) jar.seed(ACCOUNT, k, v)
+  }
+  let at = login
+  for (let hop = 0; ; hop++) {
+    if (hop > 10) throw new Error("Xiaomi MiMo platform sign-in: too many redirects")
+    const c = jar.header(at)
+    res = await fetch(at, { headers: c ? { Cookie: c } : {}, redirect: "manual", signal })
+    jar.take(res, at)
+    const loc = res.headers.get("location")
+    if (res.status < 300 || res.status >= 400 || !loc) break
+    await res.arrayBuffer().catch(() => {})
+    const next = new URL(loc, at)
+    // the followup is written http://; the session's cookies go back over https
+    if (next.protocol === "http:" && next.host === new URL(PLATFORM).host) next.protocol = "https:"
+    at = next.href
+  }
+  text = await res.text()
+  const d = res.status === 200 ? data(text) : undefined
+  // back on Xiaomi's sign-in page: the passToken doesn't sign on here
+  if (d === undefined) throw new Error(`Xiaomi MiMo platform ${path}: the Xiaomi account didn't sign on (${statusLine(res.status)})`)
+  const got = {}
+  for (const c of jar.for(PLATFORM + "/")) got[c.name] = c.value
+  return { cookies: got, data: d }
+}
+
 // cookieHeader is a session as a Cookie header, in a steady order
 function cookieHeader(cookies) {
   const first = ["serviceToken", "userId", "cUserId"]
@@ -289,6 +354,14 @@ async function signedInWith(p, device) {
 // allowance is left (percent remaining, and the day it resets; no reset
 // date is no plan), and /user/xiaomi/subscription/self, the plan in force
 // and when it ends. An account with no plan is on MiMo's free offer.
+
+// credits is a count of the Token Plan's credits, short: 6.81M, 4.1B
+function credits(n) {
+  for (const [d, u] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]]) {
+    if (n >= d) return `${Number((n / d).toPrecision(3))}${u}`
+  }
+  return String(n)
+}
 
 // the app's names for its plans' tiers
 const TIERS = { 1: "Starter", 2: "Plus", 3: "Pro", 4: "Ultra" }
@@ -463,6 +536,7 @@ export const MimoAuthPlugin = async ({ client }) => {
     }
     const c = self?.current
     const out = { plan: "Free" }
+    const tp = await tokenPlan(getAuth)
     if (c && typeof c === "object") {
       const text = (v) => (typeof v === "string" ? v.trim() : "")
       out.plan = text(c.title) || TIERS[c.planTier] || text(c.planCode) || "MiMo"
@@ -470,6 +544,11 @@ export const MimoAuthPlugin = async ({ client }) => {
       if (until) out.until = until
       if (c.renewalMode === "MONTHLY" || c.renewalMode === "YEARLY") out.renew = "auto"
       else if (c.renewalMode === "ONE_TIME") out.renew = "off"
+    } else if (tp) {
+      // no app plan: the account's plan is the platform's Token Plan
+      out.plan = tp.plan
+      if (tp.until) out.until = tp.until
+      out.renew = tp.renew
     }
     let use
     try {
@@ -477,18 +556,63 @@ export const MimoAuthPlugin = async ({ client }) => {
     } catch (e) {
       if (e instanceof SignInGone) out.error = e.message
       // the plan alone, when the week's allowance can't be read
-      return { ...out, signIn: read.signIn }
+      return { ...out, ...(tp?.window && { windows: [tp.window] }), signIn: read.signIn }
     }
     out.signIn = read.signIn
     const percent = use?.percent
     const reset = use?.resetDate
+    const windows = []
     // no plan: the free offer shows no allowance
-    if (typeof percent !== "number" || typeof reset !== "string") return out
-    const w = { name: "7 days", used: Math.max(0, Math.min(100, 100 - percent)), span: 7 * 24 * 3600 }
-    const at = serverTime(reset)
-    if (at) w.resetsAt = at
-    out.windows = [w]
+    if (typeof percent === "number" && typeof reset === "string") {
+      const w = { name: "7 days", used: Math.max(0, Math.min(100, 100 - percent)), span: 7 * 24 * 3600 }
+      const at = serverTime(reset)
+      if (at) w.resetsAt = at
+      windows.push(w)
+    }
+    if (tp?.window) windows.push(tp.window)
+    if (windows.length) out.windows = windows
     return out
+  }
+
+  // tokenPlan is the account's Token Plan at the open platform, as
+  // {plan, until, renew, window}, or null: none, or the platform can't be
+  // read (the app's card goes on without it). Its credits are spent by
+  // its tp- key, not by this account's requests, so they are an aside.
+  const platform = new Map() // userId -> the platform's session cookies
+  const tokenPlan = async (getAuth) => {
+    const a = fromAuth(await getAuth())
+    if (!a) return null
+    const who = String(a.creds.userId)
+    try {
+      const d = await platformPage(a.creds, "/tokenPlan/detail", platform.get(who))
+      platform.set(who, d.cookies)
+      const p = d.data
+      const name = typeof p?.planName === "string" ? p.planName.trim() : ""
+      if (!name || p.expired !== false) return null
+      const out = { plan: `Token Plan ${name}`, renew: p.enableAutoRenew || p.hasAutoRenewSubscribed ? "auto" : "off" }
+      // the platform's times are UTC ("有效期至 2026-11-06 23:59:59 (UTC)")
+      const end = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(p.currentPeriodEnd ?? "") ? Date.parse(p.currentPeriodEnd.replace(" ", "T") + "Z") : NaN
+      if (!isNaN(end)) out.until = new Date(end).toISOString()
+      try {
+        const u = await platformPage(a.creds, "/tokenPlan/usage", d.cookies)
+        platform.set(who, u.cookies)
+        const items = [...(u.data?.monthUsage?.items ?? []), ...(u.data?.usage?.items ?? [])]
+        const it = items.find((x) => x?.name === "month_total_token") ?? items.find((x) => x?.name === "plan_total_token")
+        if (Number.isFinite(it?.used) && Number(it?.limit) > 0) {
+          out.window = {
+            name: "Token Plan · API key",
+            used: Math.max(0, Math.min(100, (100 * it.used) / it.limit)),
+            display: `${credits(it.used)} / ${credits(it.limit)} credits`,
+            aside: true,
+          }
+          if (out.until) out.window.resetsAt = out.until
+        }
+      } catch {}
+      return out
+    } catch {
+      platform.delete(who)
+      return null
+    }
   }
 
   return {
@@ -585,4 +709,4 @@ export const MimoAuthPlugin = async ({ client }) => {
 }
 
 // for tests
-export const _internal = { serverTime, vendorError }
+export const _internal = { serverTime, vendorError, credits }

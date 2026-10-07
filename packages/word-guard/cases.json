@@ -56,5 +56,16 @@
     "expect_response": { "content": [{ "type": "text", "text": "***" }, { "type": "tool_use", "input": { "q": "acme" } }] } },
   { "name": "replies untouched unless asked",
     "options": { "words": ["acme"], "action": "mask" },
-    "response": { "content": [{ "type": "text", "text": "acme" }] } }
+    "response": { "content": [{ "type": "text", "text": "acme" }] } },
+  { "name": "a Gemini reply is masked in its own place, streamed and whole",
+    "ctx": { "protocol": "gemini" },
+    "options": { "words": ["acme"], "action": "mask", "replies": true },
+    "events": [
+      { "data": { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "acme Inc" }] } }] } },
+      { "data": { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "and acme" }, { "functionCall": { "name": "acme", "args": {} } }] }, "finishReason": "STOP" }] } }],
+    "expect_events": [
+      { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "*** Inc" }] } }] },
+      { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "and ***" }, { "functionCall": { "name": "acme", "args": {} } }] }, "finishReason": "STOP" }] }],
+    "response": { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "acme", "thought": true }, { "text": "acme" }] } }] },
+    "expect_response": { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "***", "thought": true }, { "text": "***" }] } }] } }
 ]

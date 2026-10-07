@@ -40,6 +40,10 @@ Keys don't expire, so there is nothing to refresh.
 
 The plan is read from `/alpha/billing/subscriptions`. It is cached for 10
 minutes; after a failed read, the plugin tries again after 1 minute.
+When the plan isn't known yet and the Provider API refuses the key with
+"Your Go plan doesn't include API access", the key is taken as Go's from
+then on (and saved so with it), and a chat completion is sent again to
+`/alpha/generate`.
 
 ## Models
 

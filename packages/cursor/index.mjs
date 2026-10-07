@@ -1174,47 +1174,218 @@ function usageOf(uf) {
 // was read from the cache and written to it, as TurnEndedUpdate does; one
 // shows about 2.5 s after the Run is closed. STEP_WAIT is how long a step's
 // is looked for: first after that long, then every so often until the
-// end, after which it is guessed as before.
-const STEP_WAIT = { first: 1500, every: 500, until: 6000 }
+// end (each ask given `ask` to answer).
+//
+// Far from Cursor none shows in that time (yetone/magpie#1053: a round
+// trip of 4.2 s, the event 4–5 s after the Run closes), and waiting longer
+// would hold every tool step longer. So a tool step's Run is owed by its
+// conversation (owed): the step counts every event of the conversation's
+// owed Runs that has shown by the end of its wait, its own or earlier
+// ones, and what hasn't shown is collected by the conversation's next
+// steps, in the background from `owedAt` after the Run closed. A step
+// whose count is still owed says 0 used; the conversation's steps add up
+// to what Cursor counted, some of it a step or two late. A step that ends
+// the turn waits for what is still owed, as nothing may follow it soon.
+// After `skipAfter` steps in a row of an account's left something owed,
+// its steps stop waiting (but every `retryEvery`th), and leave it to the
+// next. A debt not collected in `owedFor` is let go. With no
+// conversation_id naming the session nothing later could collect a Run's
+// event: its step looks for it as before, and is guessed without it.
+const STEP_WAIT = { first: 1500, every: 500, until: 6000, ask: 5000, skipAfter: 3, retryEvery: 10, owedAt: 5000, owedFor: 600_000 }
 
 // claimed are the usage events already counted, by conversation and time,
 // so that two steps of one conversation never count the same one.
 const claimed = new Map()
 
-// stepUsage is the usage of the Run of conversation conv started at since,
-// as the dashboard's usage events count it; null when none shows in time.
-async function stepUsage(tok, conv, since, signal) {
+// owed are what each conversation still owes, by conversation_id: n Runs
+// whose events are to be counted, the earliest started at since, looked
+// for from ready on; and carry, a count collected that no step gave out.
+const owed = new Map()
+
+// flights are each conversation's collections still going, which a step
+// that ends the turn waits for.
+const flights = new Map()
+
+// unreadable are the accounts (by token) whose usage events Cursor won't
+// give (a 4xx), for owedFor: their steps are guessed, as before, and owe
+// nothing. misses are how many steps in a row of an account's left
+// something owed.
+const unreadable = new Map()
+const misses = new Map()
+const tokKey = (tok) => createHash("sha256").update(tok).digest("hex")
+function canRead(tok) {
+  const at = unreadable.get(tokKey(tok))
+  if (at === undefined) return true
+  if (Date.now() - at < STEP_WAIT.owedFor) return false
+  unreadable.delete(tokKey(tok))
+  return true
+}
+
+const ZERO = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 })
+function addUsage(a, b) {
+  if (!b) return a
+  if (!a) return { ...b }
+  for (const k of Object.keys(a)) a[k] += b[k] ?? 0
+  return a
+}
+
+// owe adds to conversation conv's debt.
+function owe(conv, { since = Date.now(), n = 0, ready = Date.now(), carry = null }) {
+  for (const [k, d] of owed) if (Date.now() - d.since > STEP_WAIT.owedFor) owed.delete(k)
+  if (n <= 0 && !carry) return
+  const d = owed.get(conv)
+  if (!d) return void owed.set(conv, { since, n, ready, carry: carry && { ...carry } })
+  d.since = Math.min(d.since, since)
+  d.n += n
+  d.ready = Math.min(d.ready, ready)
+  d.carry = addUsage(d.carry, carry)
+}
+
+// usageEvents are the dashboard's events of conversation conv from since
+// on, the `want` oldest not counted yet, summed: usage (null when none),
+// how many were found (got), and refused when the account can't read them.
+// Polling, they are looked for as STEP_WAIT says, from `first` on, until
+// all show; else asked for once.
+async function usageEvents(tok, conv, since, want, { poll = false, first = STEP_WAIT.first, signal } = {}) {
   const end = Date.now() + STEP_WAIT.until
   const wait = (ms) => new Promise((r) => {
     const t = setTimeout(r, ms)
     signal?.addEventListener("abort", () => (clearTimeout(t), r()), { once: true })
   })
-  for (const [k, at] of claimed) if (Date.now() - at > 600_000) claimed.delete(k)
-  await wait(STEP_WAIT.first)
+  for (const [k, at] of claimed) if (Date.now() - at > 2 * STEP_WAIT.owedFor) claimed.delete(k)
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
+  let usage = null
+  let got = 0
+  if (poll) await wait(first)
   while (!signal?.aborted) {
     try {
       const res = await fetch(API + "/aiserver.v1.DashboardService/GetFilteredUsageEvents", {
         method: "POST",
         headers: await headersFor(tok),
         body: JSON.stringify({ teamId: 0, startDate: String(since - 60_000), endDate: String(Date.now() + 60_000), page: 1, pageSize: 50 }),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(STEP_WAIT.ask),
       })
-      if (res.status >= 400 && res.status < 500 && res.status !== 429) return null // not this account's to read
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+        // not this account's to read
+        unreadable.set(tokKey(tok), Date.now())
+        return { usage, got, refused: true }
+      }
       const evs = res.ok ? ((await res.json())?.usageEventsDisplay ?? []) : []
-      const ev = evs
+      const found = evs
         .filter((e) => e?.conversationId === conv && e.tokenUsage && num(e.timestamp) >= since - 1000 && !claimed.has(conv + "\0" + e.timestamp))
-        .sort((a, b) => num(a.timestamp) - num(b.timestamp))[0]
-      if (ev) {
+        .sort((a, b) => num(a.timestamp) - num(b.timestamp))
+        .slice(0, want - got)
+      for (const ev of found) {
         claimed.set(conv + "\0" + ev.timestamp, Date.now())
         const t = ev.tokenUsage
-        return { input: num(t.inputTokens), output: num(t.outputTokens), cacheRead: num(t.cacheReadTokens), cacheWrite: num(t.cacheWriteTokens), reasoning: 0 }
+        usage = addUsage(usage ?? ZERO(), { input: num(t.inputTokens), output: num(t.outputTokens), cacheRead: num(t.cacheReadTokens), cacheWrite: num(t.cacheWriteTokens) })
+        got++
       }
+      if (got >= want) break
     } catch {}
-    if (Date.now() + STEP_WAIT.every > end) return null
+    if (!poll || Date.now() + STEP_WAIT.every > end) break
     await wait(STEP_WAIT.every)
   }
-  return null
+  return { usage, got, refused: false }
+}
+
+// stepUsage is the usage of the Run of conversation conv started at since,
+// as the dashboard's usage events count it; null when none shows in time.
+async function stepUsage(tok, conv, since, signal) {
+  return (await usageEvents(tok, conv, since, 1, { poll: true, signal })).usage
+}
+
+// collect takes conversation conv's debt and asks for its events (polling
+// when poll): what was carried and what was found (usage), and whether
+// any is still owed (short), which is owed on. What comes back once the
+// Run that asked is over (over() true) is carried to the next instead.
+function collect(tok, conv, { poll = false, first, signal, over = () => false } = {}) {
+  const d = owed.get(conv)
+  if (!d) return Promise.resolve({ usage: null, short: false })
+  owed.delete(conv)
+  const p = (async () => {
+    let r = { usage: null, got: 0 }
+    if (d.n > 0 && canRead(tok)) r = await usageEvents(tok, conv, d.since, d.n, { poll, first, signal }).catch(() => r)
+    const short = d.n > r.got && canRead(tok)
+    if (short) owe(conv, { since: d.since, n: d.n - r.got, ready: d.ready })
+    const usage = addUsage(d.carry, r.usage)
+    if (!over()) return { usage, short }
+    owe(conv, { carry: usage })
+    return { usage: null, short }
+  })()
+  const set = flights.get(conv) ?? new Set()
+  flights.set(conv, set.add(p))
+  p.finally(() => {
+    set.delete(p)
+    if (!set.size && flights.get(conv) === set) flights.delete(conv)
+  })
+  return p
+}
+
+// ledger is how a Run of conversation conv, started at since, has its
+// usage counted, for decode; kept when the conversation_id names the
+// session, so that a later Run of it can collect what this one owes. A
+// debt the conversation has is collected in the background. own() is a
+// step's count once it has called tools: its Run owed, what has shown of
+// the debt by the end of the wait (or at once, when the account's never
+// show in time); false when nothing has, null when the step is to be
+// guessed (not kept, and its event not found, or an account that can't
+// read its events). owed(final) is what the Run collected otherwise,
+// all that can be had when final. done() ends the Run: what was collected
+// and not given out goes back.
+function ledger(tok, conv, since, signal, kept) {
+  const key = tokKey(tok)
+  let pending = null // collected, not given out yet
+  let over = false
+  const gather = (opts) =>
+    collect(tok, conv, { ...opts, over: () => over }).then((r) => {
+      pending = addUsage(pending, r.usage)
+      return r
+    })
+  let collecting = null
+  const debt = kept ? owed.get(conv) : undefined
+  const timer = debt ? setTimeout(() => (collecting = gather()), Math.max(0, debt.ready - Date.now())) : null
+  timer?.unref?.()
+  const take = () => {
+    const u = pending
+    pending = null
+    return u
+  }
+  return {
+    async own() {
+      if (!canRead(tok)) return null
+      const m = misses.get(key) ?? 0
+      const waits = m < STEP_WAIT.skipAfter || m % STEP_WAIT.retryEvery === 0
+      if (!kept) {
+        const r = waits ? await usageEvents(tok, conv, since, 1, { poll: true, signal }).catch(() => ({})) : {}
+        if (r.usage) misses.delete(key)
+        else if (!r.refused) misses.set(key, m + 1)
+        return r.usage ?? null
+      }
+      owe(conv, { since, n: 1, ready: Date.now() + STEP_WAIT.owedAt })
+      if (waits) {
+        const r = await gather({ poll: true, signal })
+        if (!canRead(tok)) return null
+        if (r.short) misses.set(key, m + 1)
+        else misses.delete(key)
+      } else misses.set(key, m + 1)
+      return take() ?? false
+    },
+    async owed(final) {
+      if (!kept) return null
+      if (final) {
+        await collecting
+        await Promise.all([...(flights.get(conv) ?? [])])
+        if (owed.has(conv)) await gather({ poll: owed.get(conv).n > 0, first: 0, signal })
+      }
+      return take()
+    },
+    done() {
+      over = true
+      clearTimeout(timer)
+      if (pending) owe(conv, { carry: take() })
+    },
+  }
 }
 
 // buildRun is the Run's first message, an AgentClientMessage with its
@@ -1332,6 +1503,10 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
   // its usage event is found by it
   const cid = convID || randomUUID()
   const since = Date.now()
+  // how its usage is counted: a debt of the conversation's is collected
+  // while it goes, which only a conversation_id that names the session
+  // could have run up
+  const book = ledger(tok, cid, since, signal, !!convID)
   const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, cid, { maxMode, params })
   const o = await open(
     base,
@@ -1348,7 +1523,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
     },
     signal,
   )
-  if (o.error) return o
+  if (o.error) return book.done(), o
   const { session, req } = o
   let closed = false
   const send = (msg) => {
@@ -1373,6 +1548,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
       for await (const c of req) chunks.push(c)
     } catch {}
     close()
+    book.done()
     return { error: failure(o.status, Buffer.concat(chunks).toString("utf8").slice(0, 1 << 20)) }
   }
   const it = decode(frames(req), {
@@ -1381,19 +1557,21 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
     tools,
     estimate: conv.estimate,
     close,
-    stepUsage: () => stepUsage(tok, cid, since, signal),
+    stepUsage: book.own,
+    owedUsage: book.owed,
   })
   const wrapped = (async function* () {
     try {
       yield* it
     } finally {
       close()
+      book.done()
     }
   })()
   // an error comes before anything of the answer: out of quota, a model the
   // plan doesn't have — answered with its own status
   const head = await wrapped.next()
-  if (head.done) return { error: { status: 502, message: "an empty reply" } }
+  if (head.done) return book.done(), { error: { status: 502, message: "an empty reply" } }
   if (head.value.error) {
     await wrapped.return()
     return { error: head.value.error }
@@ -1408,7 +1586,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
 
 // decode follows the server's messages into the answer's pieces until the
 // turn ends, or the model has made its tool calls.
-async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage }) {
+async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage, owedUsage }) {
   let calls = 0
   // ended: Cursor said what the turn used
   let ended = false
@@ -1417,11 +1595,19 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage 
   // wrote: the reply's text alone; a turn of thinking only says nothing
   let wrote = 0
   let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
-  const finish = () => {
-    if (!usage.output) usage.output = Math.floor((said + 3) / 4)
+  // counted: the step's usage is the dashboard's events, its own counted
+  // with it or by a later step (ledger), never guessed
+  let counted = false
+  // finish is the step's end, with what earlier steps owed (more), which
+  // is no reason not to guess the step's own
+  const finish = (more) => {
+    if (!counted && !usage.output) usage.output = Math.floor((said + 3) / 4)
     // a guess only when Cursor counted nothing: a prompt read whole from
-    // the cache leaves no uncached rest, and is no reason to guess
-    if (!usage.input && !usage.cacheRead && !usage.cacheWrite) usage.input = estimate
+    // the cache leaves no uncached rest, and is no reason to guess; nor is
+    // a prompt counted from the events
+    if (!counted && !usage.input && !usage.cacheRead && !usage.cacheWrite) usage.input = estimate
+    // the events' output is their steps', counted here as their prompt is
+    if (more) for (const k of ["input", "output", "cacheRead", "cacheWrite"]) usage[k] += more[k]
     const prompt = usage.input + usage.cacheRead + usage.cacheWrite
     return {
       stop: calls > 0 ? "tool_calls" : "stop",
@@ -1435,14 +1621,17 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage 
     }
   }
   // settled is finish once a step that called tools has its usage: the
-  // dashboard's count, the Run closed first, when the turn didn't end
+  // dashboard's count, the Run closed first, when the turn didn't end (or
+  // owed); and with what the conversation's earlier steps owed, which a
+  // step that ends the turn waits for
   const settled = async () => {
     if (calls > 0 && !ended && stepUsage) {
       close?.()
       const u = await stepUsage().catch(() => null)
       if (u) usage = u
+      counted = u === false || !!u
     }
-    return finish()
+    return finish(owedUsage ? await owedUsage(calls === 0).catch(() => null) : null)
   }
   const closeExec = (id) => send(pb().bytes(5, pb().bytes(1, pb().varint(1, id))).done())
   try {
@@ -1485,7 +1674,7 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage 
                   if (calls === 0) {
                     // nothing written and nothing called: an empty reply,
                     // which the client asks again, not a finished turn
-                    yield wrote === 0 ? { error: { status: 502, message: "an empty reply" } } : finish()
+                    yield wrote === 0 ? { error: { status: 502, message: "an empty reply" } } : await settled()
                     return
                   }
                   break
@@ -1810,4 +1999,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { STEP_WAIT, stepUsage, catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { STEP_WAIT, stepUsage, ledger, owed, flights, misses, unreadable, catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

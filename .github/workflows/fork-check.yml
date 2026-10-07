@@ -1,0 +1,26 @@
+name: fork-check
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.repository == 'cdryzun/magpie-plugins'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Check plugin interfaces
+        run: bun scripts/check.mjs
+      - name: Test all packages
+        run: |
+          test_home=$(mktemp -d)
+          trap 'find "$test_home" -depth -delete' EXIT
+          env HOME="$test_home" bun test

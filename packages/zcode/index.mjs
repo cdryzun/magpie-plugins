@@ -403,7 +403,9 @@ const isNum = (v) => typeof v === "number" && Number.isFinite(v)
 // the current value), else the percentage given. TIME_LIMIT is the month's
 // MCP tool calls, which ZCode shows but never stops the models on, so it is
 // set aside, as is a limit whose whole is told as 0: no cap (an older
-// plan's), which the vendor may still give as 100% used.
+// plan's), which the vendor may still give as 100% used. A window whose
+// count is told carries it as amount of limit, so magpie's card says the
+// count as used or as left, as it says the share beside it (#659).
 function limitWindows(d) {
   const out = []
   for (const x of d?.limits ?? []) {
@@ -417,9 +419,13 @@ function limitWindows(d) {
       if (isNum(x.remaining)) {
         const used = total - x.remaining
         w.used = (100 * used) / total
+        w.amount = used
+        w.limit = total
         w.display = `${compact(used)} / ${compact(total)}`
       } else if (isNum(x.currentValue)) {
         if (!isNum(x.percentage)) w.used = (100 * x.currentValue) / total
+        w.amount = x.currentValue
+        w.limit = total
         w.display = `${compact(x.currentValue)} / ${compact(total)}`
       }
     }
@@ -545,7 +551,11 @@ async function giftOf(s) {
     const w = { name: base, used: 0, _plan: str(owner.name), _spent: giftSpent(x) }
     if (used === undefined) used = total !== undefined && left !== undefined ? total - left : 0
     if (total > 0) {
+      // the bucket's count as amount of limit, as the Coding windows' is
+      // (#659): magpie says it as used or as left, as it says the share
       w.used = (100 * used) / total
+      w.amount = used
+      w.limit = total
       w.display = `${compact(used)} / ${compact(total)}`
     }
     if (w._spent) w.used = Math.max(100, w.used)
@@ -566,6 +576,30 @@ async function giftOf(s) {
     out.windows.push(w)
   }
   return out
+}
+
+// claimHint is the card's line for gift plans ZCode is holding for the
+// account but has not put on it: GET /billing/preview lists them, and
+// only the ZCode app claims one — its claim takes the Aliyun captcha
+// attestation the app's own renderer makes, so the plugin reads the list
+// and asks the user to claim it there. A window, set aside (it is no
+// allowance: using it up stops nothing), so the card shows it and
+// routing, caps and the menu bar pass it over. null when there is
+// nothing to claim, the preview failing or listing none among it: a
+// failed read is no line at all, never a card or a refusal of its own.
+async function claimHint(s) {
+  if (!s.jwt || jwtExpired(s.jwt)) return null
+  let d
+  try {
+    d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device })
+  } catch {
+    return null
+  }
+  const plans = (Array.isArray(d?.plans) ? d.plans : []).filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
+  if (!plans.length) return null
+  const n = plans.length
+  const name = first(...plans.map((p) => (typeof p?.name === "string" ? p.name : "")), "ZCode gift plan")
+  return { name, used: 0, aside: true, display: `${n} to claim · claim ${n === 1 ? "it" : "them"} in the ZCode app` }
 }
 
 // startUsage is a gift-only account's card: its buckets, or the words
@@ -636,8 +670,8 @@ async function dualUsage(s, { startFlashFirst = false } = {}) {
       // Flash model and the coding windows drop it, so routing and the
       // card both count the pool a turn will actually spend. Once the
       // bucket is spent it stops being in gift.models, the coding windows
-      // count Flash again, and the spent sibling can hold nothing up.
-      const startFlash = startFlashFirst && (gift?.models ?? []).some((m) => m.toLowerCase() === flashModel)
+      // count Flash again, and a spent or cooling sibling can hold nothing up.
+      const startFlash = startFlashFirst && gift != null && giftUsable(s, gift, flashModel)
       if (startFlash) out.windows = out.windows.map((w) => w.aside ? w : { ...w, notModels: [...new Set([...(w.notModels ?? []), flashModel])] })
       // Several buckets may serve one model: one spent sibling cannot block it.
       const best = bestBuckets(g.windows)
@@ -1495,6 +1529,7 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
             // own body and headers, with the plan's key on
             const original = { ...opts }
             const onCoding = () => {
+              autoStart = false // Only a Start response may trigger a Coding replay.
               const h2 = new Headers(original.headers)
               h2.delete("authorization")
               h2.set("x-api-key", s.key)
@@ -1616,9 +1651,16 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
             return saved(await teamUsage(s, key))
           }
           const { start, gift } = await plansOf(s)
-          if (start) return saved(await startUsage(s))
-          if (gift) return saved(await dualUsage(s, { startFlashFirst }))
-          return saved(await codingUsage(s))
+          const card = saved(start ? await startUsage(s) : gift ? await dualUsage(s, { startFlashFirst }) : await codingUsage(s))
+          // a gift plan ZCode holds for the account but has not put on it:
+          // named on the card, claimed in the ZCode app (its claim needs
+          // the app's captcha attestation, see claimHint). A card that is
+          // an error keeps its error and asks nothing
+          if (!card.error) {
+            const hint = await claimHint(s)
+            if (hint) card.windows = [...(card.windows ?? []), hint]
+          }
+          return card
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
         }
@@ -1648,4 +1690,4 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, spentUp, giftServes, startRefused, restStart, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, spentUp, giftServes, startRefused, restStart, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }

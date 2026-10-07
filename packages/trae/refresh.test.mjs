@@ -22,7 +22,9 @@ test("auth.refresh exchanges the refresh token, once for two asking", async () =
   const auth = signedIn({ expires: Date.now() + 60_000 })
   const [x, y] = await Promise.all([hooks.auth.refresh(auth), hooks.auth.refresh(auth)])
   expect(n).toBe(1)
-  expect(x).toEqual({ access: "jwt-2", refresh: "r-2", expires: 2000000000 * 1000 })
+  // the account had no device key: the one made for it comes back with it
+  expect(x).toMatchObject({ access: "jwt-2", refresh: "r-2", expires: 2000000000 * 1000 })
+  expect(x.devicePublicKey).toContain("BEGIN PUBLIC KEY")
   expect(y).toEqual(x)
   // asked again with the sign-in from before, it gives the one it got
   expect(await hooks.auth.refresh(auth)).toEqual(x)

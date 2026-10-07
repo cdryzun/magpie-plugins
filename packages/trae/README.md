@@ -122,7 +122,12 @@ it, as Max mode does.
 
 Reasoning: the models reason, but Trae's request takes no effort or
 thinking level, so the plugin lists no variants and a level an agent
-picks does nothing.
+picks does nothing. Every model it lists says so in its `capabilities`
+(`reasoning: true`, with `toolcall`, `temperature`, `attachment`, the
+input and output modalities and an empty `variants`), the fallback
+list's own capabilities kept where it has an entry: magpie reads
+`capabilities.reasoning` alone for a model a plugin lists, and a model
+without it is shown as one that doesn't reason (0.2.4).
 
 When no
 list can be read, the plugin uses the realm's own fallback list. Trae CN's
@@ -133,10 +138,28 @@ replaces either.
 
 ## Renewal
 
-The JWT is renewed with the refresh token at the realm's auth host,
-`/cloudide/api/v3/trae/oauth/ExchangeToken` (`api.trae.cn` for Trae CN,
-`growsg-normal.trae.ai` for Trae Global). Trae issues a new refresh token
-each time and spends the old one, so only one renewal runs at a time.
+Trae CN (since 0.2.3) renews the JWT as its clients do, bound to the
+account's device:
+
+- **Where:** `POST api.trae.cn/trae/api/v3/oauth/ExchangeToken`, with the
+  refresh token, the device (`DeviceInfo`: its id, machine id and public
+  key) and a `DeviceProof`.
+- **The device key:** an ECDSA P-256 key pair made for each account at
+  sign-in (or at the first renewal of one signed in before 0.2.3), kept
+  with the sign-in.
+- **The proof:** the key's ECDSA-SHA256 signature (base64) of
+  `POST\n/trae/api/v3/oauth/ExchangeToken\n{ClientID}\n{RefreshToken}\n{Timestamp}\n{Nonce}`.
+- **As whom:** TRAE SOLO CN (`en1oxy7wnw8j9n`, `SOLO_PC`) first, then
+  Trae CN's IDE (`ono9krqynydwx5`, `IDE_PC`).
+- **The refresh token:** kept; this renewal doesn't spend it.
+
+A token the sign-in page gives is renewed this way at once. When Trae
+turns the device-bound renewal away, the plugin renews as before 0.2.3.
+
+Trae Global, and Trae CN as a fallback, renew at the realm's auth host's
+`/cloudide/api/v3/trae/oauth/ExchangeToken` (`api.trae.cn`,
+`growsg-normal.trae.ai`). There Trae issues a new refresh token each time
+and spends the old one, so only one renewal runs at a time.
 
 magpie renews the JWT ten minutes before it ends (`refreshLead`) through
 `auth.refresh`. Each request also checks it, two minutes before the end, for
@@ -198,7 +221,9 @@ end), its device (`x-device-id`, `x-device-brand`, `x-device-type`,
 `x-os-version`, `x-app-version`) and a client's User-Agent (TRAE SOLO
 CN's Electron shell). Since 0.2.1: Bun's own User-Agent and the chat's
 headers got 9074 「当前参与用户太多，请稍后再试」 every time
-(yetone/magpie#808).
+(yetone/magpie#808). Since 0.2.3 the JWT is also bound to the device (see
+Renewal): a JWT renewed at `/cloudide/…` carries no device, and the claim
+answered it 9074 even with the client's headers.
 
 - **Status:** `POST api.trae.cn/trae/api/v2/ug/checkin_credits/status`,
   body `{"req_source":1}` (magpie's `{}` is sent as that): `enable`,

@@ -257,17 +257,75 @@ function sign(site, a, headers) {
   headers.set("X-Request-ID", msg)
 }
 
+// FLAGGED are the words WorkBuddy refuses a chat for, "Illegal API
+// invocation from an unapproved channel" (magpie #182), each with words
+// that say the same and pass: tried one by one against both builds with
+// the requests Claude Code 2.1.280 and Codex 0.159.2 send. WorkBuddy reads
+// every message, not only the system prompt (Claude Code puts its main
+// branch in the first user message), and pays no mind to case. Claude
+// Code's billing header means nothing to WorkBuddy's models and goes.
+const FLAGGED = [
+  [/x-anthropic-billing-header:[^\n]*\n?/gi, ""],
+  [/You are Claude Code, Anthropic['’]s official CLI for Claude/gi, "You are Claude Code, Anthropic's CLI for Claude"],
+  [/Main branch \(you will usually use this for PRs\)/gi, "Main branch (usually the base for PRs)"],
+  [/(?<!the )Codex CLI is an open source project led by OpenAI\./gi, "The Codex CLI is an open source project led by OpenAI."],
+]
+
+function unflagged(text) {
+  for (const [re, to] of FLAGGED) text = text.replace(re, to)
+  return text
+}
+
+// unflag puts FLAGGED's words in place in every message of a chat, and
+// leaves out a text that had nothing else (the billing header's system
+// block). It says whether it changed anything.
+function unflag(messages) {
+  let changed = false
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (typeof m?.content === "string") {
+      const t = unflagged(m.content)
+      if (t === m.content) continue
+      changed = true
+      if (t.trim() || m.role !== "system") m.content = t
+      else messages.splice(i, 1)
+    } else if (Array.isArray(m?.content)) {
+      const parts = []
+      let here = false
+      for (const p of m.content) {
+        const t = typeof p?.text === "string" ? unflagged(p.text) : null
+        if (t === null || t === p.text) {
+          parts.push(p)
+          continue
+        }
+        here = true
+        if (t.trim()) parts.push({ ...p, text: t })
+      }
+      if (!here) continue
+      changed = true
+      if (parts.length || m.role !== "system") m.content = parts
+      else messages.splice(i, 1)
+    }
+  }
+  return changed
+}
+
 // withSystem gives a chat that doesn't open with a system message
-// WorkBuddy's default one, as its app does.
+// WorkBuddy's default one, as its app does, and takes FLAGGED's words out
+// of it.
 function withSystem(body) {
   // a body magpie or OpenCode hands over as bytes is read as the text it is
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) body = new TextDecoder().decode(body)
   if (typeof body !== "string") return body
   try {
     const b = JSON.parse(body)
-    if (!Array.isArray(b?.messages) || !b.messages.length || b.messages[0]?.role === "system") return body
-    b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
-    return JSON.stringify(b)
+    if (!Array.isArray(b?.messages) || !b.messages.length) return body
+    let changed = unflag(b.messages)
+    if (b.messages[0]?.role !== "system") {
+      b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
+      changed = true
+    }
+    return changed ? JSON.stringify(b) : body
   } catch {
     return body
   }
@@ -696,12 +754,21 @@ function makePlugin(site) {
 
 // REFUSED_HINT is what the user can do about WorkBuddy's "Illegal API
 // invocation from an unapproved channel": both builds answer it to a chat
-// whose system prompt is Codex's or Claude Code's own (magpie #182),
-// whatever the headers. It ends the error's message, as magpie's built-in
+// holding words of Codex's or Claude Code's own (magpie #182), whatever the
+// headers. FLAGGED rewrites the ones known; this is for one it doesn't know. It ends the error's message, as magpie's built-in
 // put it (provider.WBRefusedHint), so magpie's routing page says it apart.
 const REFUSED_HINT =
   "WorkBuddy refuses chats from Codex and Claude Code (their system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
 const REFUSED = /unapproved channel|illegal api invocation/i
+
+// EXHAUSTED_HINT explains WorkBuddy's requirement of an active package
+// even for 0-rate / free models. When an account has no packages or 0 credits,
+// WorkBuddy returns code 14018 ("Credits exhausted...").
+const EXHAUSTED_HINT =
+  "WorkBuddy requires an active credit package even for 0-rate free models; check your account package balance"
+// The code is matched whole: a code that only begins with 14018 (140185) is
+// another error, and insufficient_quota would rest the account as out of credit.
+const EXHAUSTED_TEXT = /credits exhausted|额度已用尽|["']code["']\s*:\s*["']?14018(?![\d.])/i
 
 // kept is an answer that went through, saying the sign-in is kept: the
 // built-in never cleared a WorkBuddy account's mark, as it never set one.
@@ -711,7 +778,7 @@ function kept(res) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
 }
 
-// explained is res with REFUSED_HINT added to that refusal's message.
+// explained is res with REFUSED_HINT or EXHAUSTED_HINT added to that refusal's message.
 // Each refusal says the sign-in is kept: the built-in passed WorkBuddy's
 // 401 on and never marked a WorkBuddy account lapsed.
 async function explained(res) {
@@ -723,27 +790,37 @@ async function explained(res) {
     headers.set("X-Magpie-Sign-In", "kept")
     return new Response(b, { status: res.status, statusText: res.statusText, headers })
   }
-  if (!REFUSED.test(text)) return again(text)
-  let msg = text.trim()
   let v
   try {
     v = JSON.parse(text)
   } catch {}
   const at = v?.error && typeof v.error === "object" ? v.error : v && typeof v === "object" ? v : null
+  const code = at?.data?.code ?? at?.code ?? v?.code ?? v?.data?.code
+  const isRefused = REFUSED.test(text)
+  const isExhausted = code === 14018 || Number(code) === 14018 || EXHAUSTED_TEXT.test(text)
+  if (!isRefused && !isExhausted) return again(text)
+
+  let msg = text.trim()
   if (at && typeof at.message === "string") msg = at.message
+  else if (typeof at?.data?.msg === "string") msg = at.data.msg
   else if (typeof v?.error === "string") msg = v.error
   else if (typeof v?.msg === "string" && v.msg) msg = v.msg // WorkBuddy's own {"code", "msg"}
-  msg = `${msg} — ${REFUSED_HINT}`
+  else if (typeof v?.data?.msg === "string") msg = v.data.msg
+
+  const hint = isRefused ? REFUSED_HINT : EXHAUSTED_HINT
+  const type = isRefused ? "permission_error" : "insufficient_quota"
+  const errCode = isRefused ? null : 14018
+  msg = `${msg} — ${hint}`
   const headers = new Headers(res.headers)
   headers.set("content-type", "application/json")
   headers.delete("content-length")
   headers.delete("content-encoding")
   headers.set("X-Magpie-Sign-In", "kept")
-  return new Response(JSON.stringify({ error: { message: msg, type: "permission_error", code: null } }), { status: res.status, statusText: res.statusText, headers })
+  return new Response(JSON.stringify({ error: { message: msg, type, code: errCode } }), { status: res.status, statusText: res.statusText, headers })
 }
 
 export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { withSystem, usageOf, desktopHeld, explained, REFUSED_HINT, freeCredits, creditsOf, fresh, SITES, renewing, renewed }
+export const _internal = { withSystem, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, fresh, SITES, renewing, renewed }

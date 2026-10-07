@@ -274,6 +274,39 @@ function explain(status, text) {
 
 const DROID_LINE = "You are Droid, an AI software engineering agent built by Factory."
 
+// pi (@earendil-works/pi-coding-agent 1.0.4) opens its system prompt with
+// a sentence Factory refuses whole, on the OpenAI and Anthropic routes
+// alike (yetone/magpie#952): either half of it passes, and pi's full
+// request with the sentence cut to "You are an expert coding assistant."
+// is answered. Only that sentence, at the start of a line of a system or
+// developer prompt, changes; the rest of pi's prompt goes on as it is.
+const PI_OPENING = /(^|\n)You are an expert coding assistant operating inside pi, a coding agent harness\./
+const PI_COMPAT = "You are an expert coding assistant."
+function clientOpening(text) {
+  return typeof text === "string" ? text.replace(PI_OPENING, (_, at) => at + PI_COMPAT) : text
+}
+
+// promptOpenings adapts clientOpening in the system and developer messages
+// of msgs (chat completions' messages, Responses' input), their string
+// content or text parts: false when nothing changed.
+function promptOpenings(msgs) {
+  let changed = false
+  for (const m of Array.isArray(msgs) ? msgs : []) {
+    if (!m || typeof m !== "object" || (m.role !== "system" && m.role !== "developer")) continue
+    if (typeof m.content === "string") {
+      const adapted = clientOpening(m.content)
+      if (adapted !== m.content) (m.content = adapted), (changed = true)
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (!p || typeof p !== "object" || typeof p.text !== "string") continue
+        const adapted = clientOpening(p.text)
+        if (adapted !== p.text) (p.text = adapted), (changed = true)
+      }
+    }
+  }
+  return changed
+}
+
 // droidChat opens msgs' first system message with droid's line, or puts one
 // before them with the line alone: false when it opens so already.
 function droidChat(msgs) {
@@ -326,11 +359,15 @@ function droidBody(path, body) {
   if (path.endsWith("/responses")) {
     const v = m.instructions
     if (v !== undefined && v !== null && typeof v !== "string") return body // not something droid sends
-    const ins = v ?? ""
-    if (ins.startsWith(DROID_LINE)) return body
-    m.instructions = ins.trim() === "" ? DROID_LINE : DROID_LINE + "\n" + ins
+    const opened = promptOpenings(m.input)
+    const ins = clientOpening(v ?? "")
+    if (!ins.startsWith(DROID_LINE)) m.instructions = ins.trim() === "" ? DROID_LINE : DROID_LINE + "\n" + ins
+    else if (ins !== v || opened) m.instructions = ins
+    else return body
   } else if (path.endsWith("/chat/completions")) {
-    if (!Array.isArray(m.messages) || !droidChat(m.messages)) return body
+    if (!Array.isArray(m.messages)) return body
+    const opened = promptOpenings(m.messages)
+    if (!droidChat(m.messages) && !opened) return body
   } else return body
   return JSON.stringify(m)
 }
@@ -711,7 +748,7 @@ function anthropicBody(body) {
       block.text = DROID_LINE
       changed = true
     } else if (block?.type === "text") {
-      const adapted = systemModelLine(block.text)
+      const adapted = clientOpening(systemModelLine(block.text))
       if (adapted !== block.text) {
         block.text = adapted
         changed = true
@@ -739,7 +776,7 @@ function anthropicBody(body) {
 
   for (const message of request.messages) {
     if (message?.role === "system" && typeof message.content === "string") {
-      const adapted = systemContext(message.content)
+      const adapted = clientOpening(systemContext(message.content))
       if (adapted !== message.content) {
         message.content = adapted
         changed = true
@@ -752,7 +789,7 @@ function anthropicBody(body) {
     if (message?.role === "system" && Array.isArray(message.content)) {
       for (const block of message.content) {
         if (block?.type !== "text" || typeof block.text !== "string") continue
-        const adapted = systemContext(block.text)
+        const adapted = clientOpening(systemContext(block.text))
         if (adapted !== block.text) {
           block.text = adapted
           changed = true

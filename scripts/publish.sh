@@ -8,7 +8,9 @@
 # first version goes by hand (an npm account of the magpie-community org,
 # `scripts/publish.sh <otp>`), and its Trusted Publisher is set after. Till
 # then Actions passes it by, publishes the rest, and fails at the end
-# naming it.
+# naming it. So does a package whose publish npm refuses (one published
+# by hand whose Trusted Publisher isn't set yet answers 404): the packages
+# after it are still published.
 set -e
 cd "$(dirname "$0")/.."
 # npm's own registry, whatever ~/.npmrc names (a mirror such as npmmirror
@@ -28,9 +30,17 @@ for dir in packages/*/; do
     new="$new $name"
     continue
   fi
-  (cd "$dir" && npm publish --access public ${otp:+--otp="$otp"})
+  if ! (cd "$dir" && npm publish --access public ${otp:+--otp="$otp"}); then
+    [ -n "$GITHUB_ACTIONS" ] && echo "::error::$name@$version wasn't published: is this workflow its Trusted Publisher on npmjs.com?"
+    refused="$refused $name"
+  fi
 done
 if [ -n "$new" ]; then
   echo "not published, new to npm:$new"
+fi
+if [ -n "$refused" ]; then
+  echo "not published, refused by npm:$refused"
+fi
+if [ -n "$new$refused" ]; then
   exit 1
 fi

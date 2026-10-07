@@ -58,7 +58,15 @@ plugin's `fetch` answers them on Cursor's agent API:
   (Cursor tells it only once the tools' results come back in the same
   Run), so once the Run is closed its usage is read from the dashboard's
   usage events, by the Run's conversation id: it shows in about 2.5 s,
-  and is looked for up to 6 s, after which it is estimated as before.
+  and is looked for up to 6 s. Far from Cursor it shows later than that
+  (yetone/magpie#1053), so the step says 0 used and the conversation owes
+  it: its next steps collect the event in the background and count it
+  with their own, and a step that ends the turn waits for what is still
+  owed, so the conversation adds up to what Cursor counted. An account
+  whose events miss the wait 3 steps in a row stops waiting for them.
+  With nothing naming the session (so no later step to collect it), or
+  an account that can't read its usage events, the step is estimated as
+  before.
   Failures keep their statuses: 401 to sign in again, 429 at the
   usage limit, 400 for a prompt too long, 403 for a region refusal.
 

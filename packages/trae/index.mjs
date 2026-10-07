@@ -9,7 +9,7 @@
 // The account's fetch also sends Trae CN's own pages on api.trae.cn
 // (/trae/api/…) as the account, for magpie's daily check-in (每日签到:
 // /trae/api/v2/ug/checkin_credits/status, then /claim).
-import { randomBytes, randomUUID, randomInt } from "node:crypto"
+import { generateKeyPairSync, randomBytes, randomUUID, randomInt, sign } from "node:crypto"
 import { createServer, STATUS_CODES } from "node:http"
 
 const SITES = {
@@ -35,6 +35,21 @@ const SITES = {
       api: "https://trae-api-cn.mchost.guru", // the models
     },
     clientId: "ono9krqynydwx5", // Trae CN's IDE
+    // the clients' own renewal, which binds the JWT to a device: ExchangeToken
+    // under /trae/api/v3/oauth, signed with the device's P-256 key
+    // (DeviceProof). A JWT renewed at /cloudide/… carries no device, and
+    // Trae CN answers its check-in claim 9074 「当前参与用户太多」 every time,
+    // while the client's own token is let through (mintonight's side-by-side
+    // on yetone/magpie#808). Tried as TRAE SOLO CN first, the one
+    // qilimixingkong/trae-checkin found the server takes, then as Trae CN's
+    // IDE. It doesn't spend the refresh token.
+    deviceExchange: {
+      path: "/trae/api/v3/oauth/ExchangeToken",
+      as: [
+        { clientId: "en1oxy7wnw8j9n", platform: "SOLO_PC", version: "0.1.64" },
+        { clientId: "ono9krqynydwx5", platform: "IDE_PC", version: "3.3.99" },
+      ],
+    },
     appId: "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8",
     ideVersion: "3.3.65", // named to the authorization page
     ideVersionCode: "20260401",
@@ -220,7 +235,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // device is the machine an account signs in from, made once at sign-in and
 // named to trae.cn's authorization page, then sent with every request: a
 // fresh one each time is what the relays saw requests dropped for.
-const newDevice = () => ({ deviceId: digits(19), machineId: randomBytes(16).toString("hex") })
+const newDevice = () => ({ deviceId: digits(19), machineId: randomBytes(16).toString("hex"), ...newDeviceKey() })
+
+// newDeviceKey is the device's key pair, an ECDSA P-256 one as the clients
+// keep (iCubeAuthInfo://icube-dc:<device>), whose public half goes with a
+// renewal and whose private half signs it (DeviceProof). An account signed
+// in before 0.2.3 has none and is given one at its next renewal.
+function newDeviceKey() {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  return {
+    devicePublicKey: publicKey.export({ type: "spki", format: "pem" }),
+    devicePrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }),
+  }
+}
 
 // whenOf reads one of Trae's expiry times: seconds, milliseconds or ISO
 function whenOf(v) {
@@ -270,6 +297,7 @@ function toAuth(s, site) {
     clientId: s.clientId || site.clientId,
     deviceId: s.deviceId,
     machineId: s.machineId,
+    ...(s.devicePrivateKey ? { devicePublicKey: s.devicePublicKey, devicePrivateKey: s.devicePrivateKey } : {}),
     // the model host the sign-in named, if it named one
     ...(site.modelHost(s.api) ? { api: s.api } : {}),
     ...(s.region ? { region: s.region } : {}),
@@ -287,6 +315,8 @@ function fromAuth(auth, site) {
     clientId: auth.clientId || site.clientId,
     deviceId: auth.deviceId || "",
     machineId: auth.machineId || "",
+    devicePublicKey: auth.devicePublicKey || "",
+    devicePrivateKey: auth.devicePrivateKey || "",
     api: auth.api || "",
     region: site.regionOf(auth),
   }
@@ -387,6 +417,92 @@ async function exchange(refresh, clientId, site, host = site.hosts.auth) {
   throw new Error(`${site.realm}: renewing the sign-in: ${statusLine(res.status)} ${msg}`.trim())
 }
 
+// proofOf is a renewal's DeviceProof: the device key's ECDSA-SHA256
+// signature (DER, base64) of the method, path, client, refresh token, time
+// and nonce, one to a line, as the clients sign it
+function proofOf(path, clientId, refresh, privateKey, at = Math.floor(Date.now() / 1000), nonce = randomBytes(16).toString("hex")) {
+  const text = ["POST", path, clientId, refresh, String(at), nonce].join("\n")
+  return { Signature: sign("sha256", Buffer.from(text), privateKey).toString("base64"), Timestamp: at, Nonce: nonce }
+}
+
+// deviceInfo is the device a renewal names, its public key with it
+function deviceInfo(a, as, site) {
+  return {
+    DeviceID: a.deviceId,
+    MachineID: a.machineId,
+    PlatformCode: as.platform,
+    DeviceType: "PC",
+    DeviceName: "",
+    DeviceModel: "",
+    ClientVersion: as.version,
+    DevicePublicKey: a.devicePublicKey,
+    DeviceBrand: site.brand,
+    DeviceCPU: "AMD",
+    OSInfo: "Windows",
+    OSVersion: "10.0.22631",
+  }
+}
+
+// boundExchange renews the JWT as the clients do (site.deviceExchange), so
+// that it is bound to the account's device; an account with no device key
+// is given one first. It tries each client the site names, and throws the
+// last answer when none takes it.
+async function boundExchange(a, site, host = site.hosts.auth) {
+  const dx = site.deviceExchange
+  const d = a.devicePrivateKey && a.devicePublicKey ? a : { ...a, ...newDeviceKey() }
+  let last
+  for (const as of dx.as) {
+    let res
+    try {
+      res = await fetch(host.replace(/\/+$/, "") + dx.path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(a.token ? { Authorization: `Cloud-IDE-JWT ${a.token}` } : {}) },
+        body: JSON.stringify({
+          ClientID: as.clientId,
+          ClientSecret: "",
+          RefreshToken: a.refresh,
+          DeviceInfo: deviceInfo(d, as, site),
+          DeviceProof: proofOf(dx.path, as.clientId, a.refresh, d.devicePrivateKey),
+          IDEVersion: as.version,
+        }),
+        signal: AbortSignal.timeout(20_000),
+      })
+    } catch (e) {
+      last = new Error(`${site.realm}: renewing the sign-in for its device: ` + (e?.message ?? e))
+      continue
+    }
+    const text = await res.text()
+    const v = parseJSON(text)
+    const r = v.Result ?? v.result ?? {}
+    const token = r.Token ?? r.token ?? ""
+    if (res.ok && token) {
+      return {
+        token,
+        refresh: r.RefreshToken ?? r.refreshToken ?? a.refresh,
+        expires: whenOf(r.TokenExpireAt ?? r.tokenExpireAt) || jwtExp(token),
+        devicePublicKey: d.devicePublicKey,
+        devicePrivateKey: d.devicePrivateKey,
+      }
+    }
+    const e = errorOf(text)
+    last = new Error(`${site.realm}: renewing the sign-in for its device: ${statusLine(res.status)} ${e.message || text.trim().slice(0, 200)}`.trim())
+  }
+  throw last
+}
+
+// renewal renews an account's JWT: bound to its device where the site can
+// (boundExchange), else, or when Trae turns that away, at /cloudide/… as
+// before 0.2.3 (exchange). A device key made for the account goes with
+// either, so the next renewal signs with the same one.
+async function renewal(a, site) {
+  if (!site.deviceExchange) return exchange(a.refresh, a.clientId, site)
+  const keys = a.devicePrivateKey && a.devicePublicKey ? {} : newDeviceKey()
+  try {
+    return await boundExchange({ ...a, ...keys }, site)
+  } catch {}
+  return { ...(await exchange(a.refresh, a.clientId, site)), ...keys }
+}
+
 // ---- the browser sign-in --------------------------------------------------------
 
 const page = (ok, title, text) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${title}</title>
@@ -418,7 +534,16 @@ async function signedIn(q, device, site) {
   }
   if (!s.token) throw new Error(`${site.webHost} sent back no token`)
   if (!s.refresh) throw new Error(`${site.webHost} sent back no refresh token`)
-  return { ...s, ...device }
+  s = { ...s, ...device }
+  // the token the page gives is bound to no device: it is renewed for this
+  // one at once, so a check-in takes it; when Trae won't, it does as is
+  if (site.deviceExchange) {
+    try {
+      const x = await boundExchange(s, site)
+      s = { ...s, token: x.token, refresh: x.refresh, expires: x.expires || s.expires }
+    } catch {}
+  }
+  return s
 }
 
 // browserSignIn is the IDE's sign-in: trae.cn's authorization page, back
@@ -1167,10 +1292,14 @@ async function* parts(events, tools = []) {
   const th = new Thoughts()
   const call = (c) => ({ call: { ...c, name: toolNamed(c.name, tools) } })
   let finish = ""
+  let completed = false
   for await (const { event, data } of events) {
     const name = eventName(event)
     const d = data && typeof data === "object" ? data : {}
-    if (data === "[DONE]") break
+    if (data === "[DONE]") {
+      completed = true
+      break
+    }
     if (name === "error" || (name !== "output" && d.code && d.message && !d.response && !d.content)) {
       const e = errorOf(d)
       yield { error: e.message || "Trae CN returned an error", code: e.code }
@@ -1182,6 +1311,7 @@ async function* parts(events, tools = []) {
       continue
     }
     if (name === "done" || name === "response_done" || name === "stream_done") {
+      completed = true
       const u = tokensOf(d.usage)
       if (u) yield { usage: u }
       finish = finishOf(d) || finish
@@ -1209,6 +1339,7 @@ async function* parts(events, tools = []) {
     if (u) yield { usage: u }
     finish = finishOf(d) || finish
   }
+  if (!completed && !finish) throw new Error("Trae stream ended before its completion marker")
   const r = tt.push("", true)
   const t = r.reasoning && th.add(r.reasoning)
   if (t) yield { reasoning: t }
@@ -1451,8 +1582,9 @@ const makePlugin = (site) => async ({ client }) => {
     let r = renewing.get(key)
     if (!r) {
       r = (async () => {
-        const x = await exchange(a.refresh, a.clientId, site)
+        const x = await renewal(a, site)
         const got = { ...a, token: x.token, refresh: x.refresh, expires: x.expires || jwtExp(x.token) || Date.now() + DAY, clientId: x.clientId || a.clientId, renewed: true }
+        if (x.devicePrivateKey) Object.assign(got, { devicePublicKey: x.devicePublicKey, devicePrivateKey: x.devicePrivateKey })
         renewed.set(a.uid || a.name, { was: a.refresh, got })
         if (keep) await save(toAuth(got, site))
         return got
@@ -1465,10 +1597,11 @@ const makePlugin = (site) => async ({ client }) => {
   // fresh is the account with a token that has a while to go, renewed
   // when it hasn't
   const fresh = async (getAuth) => {
-    const a = fromAuth(await getAuth(), site)
+    let a = fromAuth(await getAuth(), site)
     if (!a) throw new Expired(`${site.realm}: not signed in`)
-    const last = renewed.get(a.uid || a.name)
-    if (last && last.was === a.refresh) return { ...last.got, renewed: false }
+    // a renewal the sign-in doesn't hold yet. A device-bound one keeps the
+    // refresh token, so the token tells it, and it is renewed in its turn
+    if (newerHere(a)) a = { ...renewed.get(a.uid || a.name).got, renewed: false }
     if (!a.expires || a.expires - Date.now() > EARLY_MS || !a.refresh) return a
     try {
       return await renew(a, true)
@@ -1485,9 +1618,22 @@ const makePlugin = (site) => async ({ client }) => {
     const a = fromAuth(auth, site)
     if (!a || !a.refresh) return undefined
     const last = renewed.get(a.uid || a.name)
-    if (last && last.was === a.refresh) return { access: last.got.token, refresh: last.got.refresh, expires: last.got.expires }
-    const s = await renew(a, false)
-    return { access: s.token, refresh: s.refresh, expires: s.expires }
+    // a device key made for the account is kept with the sign-in
+    const out = (s) => ({
+      access: s.token,
+      refresh: s.refresh,
+      expires: s.expires,
+      ...(s.devicePrivateKey && s.devicePrivateKey !== a.devicePrivateKey ? { devicePublicKey: s.devicePublicKey, devicePrivateKey: s.devicePrivateKey } : {}),
+    })
+    if (newerHere(a)) return out(last.got)
+    return out(await renew(a, false))
+  }
+
+  // newerHere: this account was renewed here since the sign-in a was read
+  // from, to a token that runs longer
+  const newerHere = (a) => {
+    const last = renewed.get(a.uid || a.name)
+    return !!last && last.was === a.refresh && last.got.token !== a.token && (last.got.expires || 0) > (a.expires || 0)
   }
 
   // post asks one of Trae's JSON pages with the account
@@ -1664,6 +1810,13 @@ const makePlugin = (site) => async ({ client }) => {
     return [...out.values()].map((x) => x.m)
   }
 
+  // modelOf is a model of the account's list as OpenCode's provider
+  // carries one. A model of the site's fallback list has capabilities
+  // already (magpie's host spreads the config's into them); one the list
+  // doesn't have gets them from MODEL's flat fields, so that magpie reads
+  // it as a model that reasons rather than one that doesn't (its host
+  // reads capabilities.reasoning alone, host.js). The fallback list stays
+  // the authority where it has an entry.
   const modelOf = (provider, m) => {
     const id = String(m.config_name)
     const was = provider.models?.[id] ?? {}
@@ -1671,7 +1824,23 @@ const makePlugin = (site) => async ({ client }) => {
     const ctx = Number(m.context_window_tokens?.dev ?? m.context_window_size?.max?.[0] ?? m.context_window_size?.max ?? m.context_window_tokens?.max ?? m.prompt_max_tokens) || was.limit?.context || MODEL.limit.context
     const out = Number(devModel(m)?.max_tokens) || was.limit?.output || 0
     const name = m.display_config?.display_name || m.display_name || m.display_model_name || was.name || id
-    return { ...MODEL, ...was, id, providerID: site.id, name: String(name), limit: { context: ctx, output: out }, api: was.api ?? { id, url: site.hosts.api, npm: "@ai-sdk/openai-compatible" } }
+    const input = (k) => (MODEL.modalities?.input ?? []).includes(k)
+    return {
+      ...MODEL, ...was, id, providerID: site.id, name: String(name), limit: { context: ctx, output: out },
+      api: was.api ?? { id, url: site.hosts.api, npm: "@ai-sdk/openai-compatible" },
+      capabilities: {
+        ...(was.capabilities ?? {}),
+        reasoning: was.capabilities?.reasoning ?? MODEL.reasoning,
+        temperature: was.capabilities?.temperature ?? MODEL.temperature,
+        attachment: was.capabilities?.attachment ?? MODEL.attachment,
+        toolcall: was.capabilities?.toolcall ?? MODEL.tool_call,
+        input: was.capabilities?.input ?? { text: true, image: input("image"), audio: input("audio"), video: input("video"), pdf: input("pdf") },
+        output: was.capabilities?.output ?? { text: true, image: false, audio: false, video: false, pdf: false },
+      },
+      // Trae's request takes no effort or thinking level, so a model has
+      // none to pick from (see the README's Reasoning)
+      variants: was.variants ?? {},
+    }
   }
 
   return {
@@ -1765,11 +1934,12 @@ const makePlugin = (site) => async ({ client }) => {
               else outer.addEventListener("abort", () => ac.abort(), { once: true })
             }
             for (const fn of [...new Set(fns)]) {
+              const attempt = new AbortController()
               const res = await fetch(apiOf(a, site) + "/api/agent/v3/llm_utils_chat", {
                 method: "POST",
                 headers: ideHeaders(a, site, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
                 body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max)),
-                signal: ac.signal,
+                signal: AbortSignal.any([ac.signal, attempt.signal]),
               })
               if (!res.ok) {
                 const text = await res.text()
@@ -1794,7 +1964,8 @@ const makePlugin = (site) => async ({ client }) => {
                 if (wrongFunction(err.code)) {
                   // another function may take it: this answer's read goes
                   // with the function it came from, not left hanging
-                  it.return?.()
+                  attempt.abort()
+                  await it.return?.().catch(() => {})
                   res.body.cancel?.().catch(() => {})
                   continue
                 }
@@ -1819,4 +1990,4 @@ const makePlugin = (site) => async ({ client }) => {
 export const TraeCNAuthPlugin = makePlugin(SITES["trae-cn"])
 export const TraeGlobalAuthPlugin = makePlugin(SITES["trae-global"])
 
-export const _internal = { HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, toolNamed, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, SITES }
+export const _internal = { HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, toolNamed, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, proofOf, SITES }

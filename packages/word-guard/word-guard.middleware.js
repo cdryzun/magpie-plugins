@@ -67,6 +67,12 @@ export function onEvent(ev, ctx) {
   else if (ev.type === "response.output_text.delta") set(ev, "delta")
   else if (ev.type === "response.output_text.done") set(ev, "text")
   else if (Array.isArray(ev.choices)) for (const c of ev.choices) set(c.delta, "content")
+  // Gemini streams its text in candidates[].content.parts[].text, the shape
+  // onResponse below already masks
+  else if (Array.isArray(ev.candidates))
+    for (const c of ev.candidates) {
+      if (c && c.content && Array.isArray(c.content.parts)) for (const p of c.content.parts) set(p, "text")
+    }
   return changed ? ev : undefined
 }
 

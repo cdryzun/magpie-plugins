@@ -4,6 +4,19 @@ Signs in to Z.ai's GLM Coding Plan, or BigModel's (智谱). It does this the
 way [ZCode](https://zcode.z.ai) does, and serves the plan's GLM models
 over Anthropic's Messages API. Provider id: `zcode`.
 
+## This fork's gateway entry
+
+Installing the repository root enables Start-first routing for the plain
+`GLM-5.3-Flash` model. An active gift bucket is used before Coding; a spent,
+expired or cooling gift leaves the request on Coding. A refused or unreachable
+Start request is replayed on Coding at most once, unless the caller cancelled
+it. Explicit `-Trial` entries retain the upstream gift-only behavior.
+
+Both pools remain visible on the usage card. During Start cooldown, the plain
+Flash model counts against Coding. Counted windows include `amount` and `limit`
+for Magpie's used/remaining display, and unclaimed gifts remain advisory lines
+that do not block routing. Claim a gift in the ZCode app.
+
 ## Signing in
 
 - **ZCode: Z.ai GLM Coding Plan** and **ZCode: BigModel (智谱) GLM Coding Plan**
@@ -94,6 +107,18 @@ showing. Every gift window is set aside for routing: magpie shows it on
 the card but never benches the account over it, because the coding plan
 serves the same model — a spent gift just sends that model back to the
 coding plan.
+
+**Gift plans ZCode holds but has not granted.** ZCode hands out one-off
+trust-build / gift plans (a day's ZCode Trust Build, say) that are not
+on the account until the ZCode app claims them. The plugin reads the
+app's own list of them (`GET /api/v1/zcode-plan/billing/preview`) with
+the card and names them there — "1 to claim · claim it in the ZCode app"
+— set aside, so the line stops nothing and routing, usage caps and the
+menu bar pass it over. The plugin never claims one: the claim needs the
+Aliyun captcha attestation only the app's renderer can make. A preview
+that fails, or lists nothing, adds no line at all, and a card that is an
+error keeps its error. Claim the plan in the ZCode app (open it once);
+the next read shows it as an ordinary gift bucket.
 
 ## Models
 

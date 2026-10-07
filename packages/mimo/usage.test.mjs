@@ -19,10 +19,15 @@ const account = (expires = Date.now() + 3_600_000) => ({
   accountId: "42",
 })
 
-async function plugin(auth, serve) {
+// the open platform with no Token Plan to read: its pages turn away an
+// account they can't sign on
+const noPlatform = () => json({ code: 401 }, 401)
+
+async function plugin(auth, serve, platform = noPlatform) {
   const seen = []
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url))
+    if (u.host === "platform.xiaomimimo.com" || u.host === "account.xiaomi.com") return platform(u, new Headers(init.headers))
     seen.push(u.pathname)
     return serve(u.pathname, new Headers(init.headers))
   }
@@ -88,6 +93,7 @@ test("two accounts signing on at once each keep their own session", async () => 
   const asked = []
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url))
+    if (u.host === "platform.xiaomimimo.com") return noPlatform()
     if (u.pathname.endsWith("/user/xiaomi/me")) {
       await new Promise((r) => setTimeout(r, 30))
       const uid = u.host[0].toUpperCase()
@@ -103,6 +109,78 @@ test("two accounts signing on at once each keep their own session", async () => 
   expect(a.plan).toBe("plan of a.example")
   expect(b.plan).toBe("plan of b.example")
   for (const x of asked) expect(x).toContain(x.startsWith("a.") ? "serviceToken=st-A" : "serviceToken=st-B")
+})
+
+// the open platform's Token Plan, as the reporter's account answered
+// (Lite, 2026-10-07): a page asked with no session is 401 with a
+// serviceLogin URL, which the passToken follows through /sts back to it
+const LOGIN = "https://account.xiaomi.com/pass/serviceLogin?callback=https%3A%2F%2Fplatform.xiaomimimo.com%2Fsts%3Fsign%3DsJaoCJbfw5dWz7lcIbXMHnGQnS0%253D%26followup%3Dhttp%253A%252F%252Fplatform.xiaomimimo.com%252Fapi%252Fv1%252FtokenPlan%252Fdetail&sid=api-platform&_group=DEFAULT"
+const DETAIL = '{"code":0,"message":"","data":{"planCode":"lite","planName":"Lite","currentPeriodEnd":"2026-11-06 23:59:59","expired":false,"enableAutoRenew":true,"autoRenewDiscount":null,"hasAutoRenewSubscribed":true,"clawEnabled":false,"clawPeriodEnd":null,"clawPurchased":false}}'
+const TP_USAGE = '{"code":0,"message":"","data":{"monthUsage":{"percent":0.0017,"items":[{"name":"month_total_token","used":6809408,"limit":4100000000,"percent":0.0017}]},"usage":{"percent":0.00,"items":[{"name":"plan_total_token","used":6809408,"limit":4100000000,"percent":0.00},{"name":"compensation_total_token","used":0,"limit":0,"percent":0}]}}}'
+const TP_WINDOW = { name: "Token Plan · API key", used: (100 * 6809408) / 4100000000, display: "6.81M / 4.1B credits", aside: true, resetsAt: "2026-11-06T23:59:59.000Z" }
+
+function platformOf(detail = DETAIL) {
+  const p = { signOns: 0, cookies: [] }
+  p.serve = (u, h) => {
+    if (u.host === "account.xiaomi.com") {
+      p.signOns++
+      expect(h.get("Cookie")).toContain("passToken=pt")
+      expect(u.searchParams.get("sid")).toBe("api-platform")
+      return new Response("", { status: 302, headers: { location: "https://platform.xiaomimimo.com/sts?sign=x&followup=" + encodeURIComponent("http://platform.xiaomimimo.com/api/v1/tokenPlan/detail") } })
+    }
+    if (u.pathname === "/sts") {
+      const r = new Response("", { status: 307, headers: { location: "http://platform.xiaomimimo.com/api/v1/tokenPlan/detail" } })
+      r.headers.append("set-cookie", "api-platform_serviceToken=pst; Path=/; HttpOnly")
+      r.headers.append("set-cookie", "userId=42; Domain=xiaomimimo.com; Path=/")
+      return r
+    }
+    const c = h.get("Cookie") ?? ""
+    p.cookies.push(c)
+    if (!c.includes("api-platform_serviceToken=pst")) return json({ code: 401, loginUrl: LOGIN }, 401)
+    if (u.pathname === "/api/v1/tokenPlan/detail") return new Response(detail, { headers: { "Content-Type": "application/json" } })
+    if (u.pathname === "/api/v1/tokenPlan/usage") return new Response(TP_USAGE, { headers: { "Content-Type": "application/json" } })
+    return json({ code: 404 }, 404)
+  }
+  return p
+}
+
+test("no app plan but a Token Plan at the open platform: the card is the Token Plan's, its credits an aside", async () => {
+  const tp = platformOf()
+  const noPlan = (path) => (path === "/api/user/usage" ? json({ code: 0, data: { percent: 0.0, resetDate: null, resetAt: null } }) : json({ code: 0, data: { groupCode: null, current: null, subscriptions: [] } }))
+  const p = await plugin(account(), noPlan, tp.serve)
+  const want = { plan: "Token Plan Lite", until: "2026-11-06T23:59:59.000Z", renew: "auto", windows: [TP_WINDOW], signIn: "kept" }
+  expect(await p.usage()).toEqual(want)
+  // the platform's session is kept: the next read doesn't sign on again
+  expect(await p.usage()).toEqual(want)
+  expect(tp.signOns).toBe(1)
+})
+
+test("an app plan stays the card's plan, the Token Plan's credits beside its week", async () => {
+  const p = await plugin(account(), (path) => (path === "/api/user/usage" ? json(USAGE) : json(SELF)), platformOf().serve)
+  expect(await p.usage()).toEqual({
+    plan: "MiMo 高阶",
+    until: "2026-10-31T16:00:00.000Z",
+    renew: "auto",
+    windows: [{ name: "7 days", used: 30, span: 604800, resetsAt: "2026-10-04T16:00:00.000Z" }, TP_WINDOW],
+    signIn: "kept",
+  })
+})
+
+test("no Token Plan, an expired one, or a platform that can't be read: the free offer as before", async () => {
+  const noPlan = (path) => (path === "/api/user/usage" ? json({ code: 0, data: { percent: 100, resetDate: null } }) : json({ code: 0, data: { current: null } }))
+  for (const detail of ['{"code":0,"message":"","data":null}', DETAIL.replace('"expired":false', '"expired":true')]) {
+    const p = await plugin(account(), noPlan, platformOf(detail).serve)
+    expect(await p.usage()).toEqual({ plan: "Free", signIn: "kept" })
+  }
+  const p = await plugin(account(), noPlan, () => json({ message: "down" }, 503))
+  expect(await p.usage()).toEqual({ plan: "Free", signIn: "kept" })
+})
+
+test("credits, short", () => {
+  expect(_internal.credits(6809408)).toBe("6.81M")
+  expect(_internal.credits(4100000000)).toBe("4.1B")
+  expect(_internal.credits(1500)).toBe("1.5K")
+  expect(_internal.credits(0)).toBe("0")
 })
 
 test("a failure is the page's and the server's word", async () => {

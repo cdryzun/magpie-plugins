@@ -459,6 +459,10 @@ function allowanceOf(c) {
 // waits for a card (15): the allowance waits for it waits.subWait at most, then
 // goes with the one read before while the reading goes on for next time.
 const subsSeen = new Map()
+
+// GO_NO_API is the Provider API refusing a Go plan's key: "Your Go plan
+// doesn't include API access. Upgrade to Provider or higher …" (#969)
+const GO_NO_API = /\bGo plan doesn.t include API access/i
 const SUB_KEEP = 10 * 60 * 1000
 const waits = { subWait: 9_000 }
 
@@ -1056,6 +1060,17 @@ async function generate(key, chat, signal) {
 export const _internal = { subsSeen, waits, liveKey, failure, goModels, GO_MODELS, GO_REFUSED }
 
 export async function CommandCodePlugin({ client } = {}) {
+  // isGo keeps a key as Go's, for its models and endpoint: in the
+  // subscriptions seen, and saved with the key as usage saves the plan read
+  async function isGo(key, auth) {
+    const was = subsSeen.get(key)?.sub
+    subsSeen.set(key, { sub: { id: was?.plan === "Go" ? was.id : "", plan: "Go" }, at: Date.now() })
+    const md = auth?.metadata ?? {}
+    if (md.plan === "Go" || !client?.auth?.set) return
+    try {
+      await client.auth.set({ path: { id: ID }, body: { ...auth, metadata: { ...md, plan: "Go" } } })
+    } catch {}
+  }
   return {
     auth: {
       provider: ID,
@@ -1076,19 +1091,31 @@ export async function CommandCodePlugin({ client } = {}) {
             const key = await liveKey((await getAuth()) ?? auth)
             headers.set("Authorization", `Bearer ${key}`)
             headers.set("x-api-key", key)
-            if (/\/chat\/completions$/.test(new URL(url).pathname) && (await planNow(key, saved)) === "Go") {
-              let chat
+            const chatting = /\/chat\/completions$/.test(new URL(url).pathname)
+            let chat
+            if (chatting) {
               try {
                 const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
                 chat = JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b))
               } catch {
                 return errorResponse({ status: 400, message: "a request that isn't JSON" })
               }
-              return kept(await generate(key, chat, init.signal))
+              if ((await planNow(key, saved)) === "Go") return kept(await generate(key, chat, init.signal))
             }
             // the Provider API's answer goes on as it came, the account
             // kept: the built-in neither marked one lapsed nor cleared it
-            return kept(await fetch(input, { ...init, headers }))
+            const res = await fetch(input, { ...init, headers })
+            if (res.ok) return kept(res)
+            // a Go key the plan wasn't known for (billing/subscriptions slow
+            // or failing, nothing saved yet) is refused by the Provider API
+            // (#969): it is Go from now on, and a chat completion is asked
+            // again where Go is served
+            const text = await res.text()
+            if (GO_NO_API.test(text)) {
+              await isGo(key, (await getAuth()) ?? auth)
+              if (chatting) return kept(await generate(key, chat, init.signal))
+            }
+            return kept(new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers }))
           },
         }
       },
