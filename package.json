@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-zcode-auth",
-  "version": "0.1.12.1",
+  "version": "0.1.12.2",
   "private": true,
   "type": "module",
   "main": "./index.mjs",

@@ -116,6 +116,18 @@ test("a spent Start bucket leaves Flash on the Coding plan", async () => {
   expect(turns[0].origin).toBe("https://api.z.ai")
 })
 
+for (const missing of [true, false]) {
+  test(`${missing ? "a missing" : "an expired"} Start stays on the Coding plan`, async () => {
+    if (missing) balance = { plans: [], balances: [] }
+    else balance.plans[0].ends_at = now - 1
+    const { res, json } = await call()
+    expect(res.status).toBe(200)
+    expect(json.content[0].text).toBe("CODING")
+    expect(sent).toHaveLength(1)
+    expect(sent[0].origin).toBe("https://api.z.ai")
+  })
+}
+
 test("a 400 from Start is the answer, not a second request", async () => {
   startReply = () => Response.json({ error: { message: "invalid model" } }, { status: 400 })
   const { res } = await call()
