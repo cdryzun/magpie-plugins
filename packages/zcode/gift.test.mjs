@@ -211,3 +211,38 @@ test("a gift-only account's spent Start Plan bucket doesn't hold up a model its 
   expect(u.windows.find((w) => w.used === 100)).toMatchObject({ name: "GLM-5.3-Flash", aside: true })
   expect(u.windows).toHaveLength(3)
 })
+
+test("a gift-only account lists its gift's models by their own names, as ZCode does (#1261)", async () => {
+  // sun1090's account: no GLM Coding Plan, the Start Plan's GLM-5.3 and
+  // GLM-5.3-Flash buckets; the card counted GLM-5.3 while the list had only
+  // GLM-5.3-Trial, as the Start Plan's config leaves GLM-5.3 out
+  balance.plans = [{ plan_id: "start", user_plan_id: "s1", name: "ZCode Start Plan", status: "active", ends_at: now + 7 * 86400 }]
+  balance.balances = [
+    { plan_id: "start", user_plan_id: "s1", show_name: "GLM-5.3", capabilities: ["model:GLM-5.3"], total_units: 3_000_000, used_units: 41_030, remaining_units: 2_958_970 },
+    { plan_id: "start", user_plan_id: "s1", show_name: "GLM-5.3-Flash", capabilities: ["model:GLM-5.3-Flash"], total_units: 5_000_000, used_units: 170_088, remaining_units: 4_829_912 },
+  ]
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+  const h = await hooks()
+  const models = await h.provider.models({ models: {} }, { auth: only })
+  expect(models["GLM-5.3"]).toMatchObject({ id: "GLM-5.3", name: "GLM-5.3", api: { id: "GLM-5.3" } })
+  expect(Object.keys(models["GLM-5.3"].variants ?? {})).toEqual(["low", "high", "max"])
+  // the trial entries a user may have picked stay, and nothing is listed twice
+  expect(models["GLM-5.3-Trial"]).toBeDefined()
+  expect(models["GLM-5.3-Flash-Trial"]).toBeDefined()
+  const ids = Object.keys(models).map((id) => id.toLowerCase())
+  expect(new Set(ids).size).toBe(ids.length)
+  // every model the card counts is one the list has
+  const u = await h.auth.usage(async () => only, { id: "zcode" })
+  for (const w of u.windows) for (const m of w.models ?? []) expect(models[m]).toBeDefined()
+  // and a request for it goes to the Start Plan
+  const loader = await h.auth.loader(async () => only, { id: "zcode" })
+  await loader.fetch(MSG, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "GLM-5.3", messages: [{ role: "user", content: "hi" }], max_tokens: 10 }) })
+  expect(sent.at(-1)).toMatchObject({ origin: "https://zcode.z.ai", body: { model: "GLM-5.3" } })
+})
+
+test("a coding plan account's gift stays on its trial entries alone", async () => {
+  balance.balances[0].capabilities = ["model:GLM-5.3"]
+  const coding = await (await hooks()).provider.models({ models: {} }, { auth: { type: "api", key: state.key } })
+  const models = await (await hooks()).provider.models({ models: {} }, { auth })
+  expect(Object.keys(models).filter((id) => !(id in coding))).toEqual(["GLM-5.3-Trial"])
+})

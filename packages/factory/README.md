@@ -93,6 +93,8 @@ instructions, environment values, tool definitions, images and reasoning
 options. Ordinary Droid requests remain unchanged, and OpenAI routes keep
 their existing request adapter. Quoted fixed metadata in tool results is
 handled as described below.
+The fixed Claude identity is recognized as a complete first line too when
+magpie joins it with the following system instructions into one text block.
 
 For the built-in `update-config` skill, the adapter changes only the known
 self-reference "not Claude" to "not the assistant" inside a complete
@@ -103,6 +105,10 @@ Claude 5 can send runtime metadata in string-content `system` messages
 instead of user-message reminders. The plugin adapts the known environment,
 model and configuration-skill metadata in that shape too, preserving the
 message role, environment values and session instructions.
+Startup hooks (`SessionStart` or `SubagentStart`, including additional
+context) and deferred-tool announcements may precede that environment
+block. The adapter preserves the prefix verbatim and adapts the generated
+runtime context after it, including when folded into user text.
 After `/model` switches, Claude Code can send model-only system updates
 without the initial environment paragraph. Updates beginning with the known
 model paragraph and containing complete generated token metadata are
@@ -111,14 +117,54 @@ Token budgets, permission instructions and conversation history are preserved.
 The same model-update adaptation covers updates that start with the complete
 generated `# Environment update` block after a working-directory change.
 
+Claude Code's generated compaction summaries also have a fixed opening
+that Factory refuses. The adapter recognizes the two generated opening
+sentences and rephrases only the first in user strings and text blocks,
+including summaries without a `Summary:` label. The generated artifact
+provenance marker and note stay verbatim. If the summary itself quotes any
+of the refused client phrases handled in tool output, the context after the
+two opening sentences is encoded as a JSON string with explicit decoding
+instructions. Decoding restores the exact summary, transcript path and
+continuation instructions; context without those phrases stays verbatim.
+Complete generated reminders for restored Read calls and omitted files are
+adapted too. Read arguments and file paths are preserved; quoted or incomplete
+reminders are left alone.
+Claude Code can also combine reminders into a token-prefixed `system` turn
+without the reminder wrappers. The adapter handles the known metadata
+paragraphs in that form, including skill-list updates, while retaining
+numbered file contents, token markers and SessionStart hook output.
+The same adaptation applies when a translating gateway folds that complete
+token-prefixed block into a user message.
+Standalone skill updates can instead start with the generated skill-list
+header and end with a token marker, for example when leaving auto mode.
+That complete form receives the same adaptation while retaining the skill
+descriptions and mode-change instructions.
+When runtime notifications precede the skill update, the adapter recognizes
+the complete skill-header and bullet-list paragraphs inside a token-terminated
+bundle. It preserves MCP connection errors, other notifications, mode updates
+and custom skill descriptions while adapting the known built-in description.
+
 Factory can also refuse fixed client phrases quoted in tool results, such as
 the identity/environment definitions printed when inspecting this plugin's
-source. Those text results are represented as JSON strings with explicit
+source, or the compaction opening embedded in a historical session JSONL
+record. Those text results are represented as JSON strings with explicit
 decoding instructions and Unicode escapes for the fixed phrases. Decoding
 the string recovers the exact original output, including quotes, backslashes
 and Unicode; the plugin does not delete the output or replace its identities
 with different ones. Tool ids, cache/error markers and non-text blocks stay
 unchanged. Ordinary tool results are forwarded as before.
+The same lossless encoding applies to restored or `@`-attached Read file text
+after the exact `Result of calling the Read tool:` header, including complete
+reminder wrappers and announced runtime bundles. The generated header and
+wrapper stay intact. File text without a known refused phrase is unchanged.
+Claude Code's complete changed-on-disk notifications receive the same handling:
+only the numbered file snippet is encoded, retaining its TAB or colon line
+separators, hunk separators and truncation notice. The path and instructions
+about respecting the current file stay verbatim. This covers wrapped user
+attachments and generated system bundles, including notifications before a
+token marker. Changed-file text supplied by hooks, quoted or incomplete
+notifications, and notices that omit the snippet are left alone. Model and
+environment metadata after non-startup hooks retain their existing adaptation.
 
 Use magpie's Claude Code integration to select the Factory provider.
 magpie manages the provider-specific client settings, including capability

@@ -889,6 +889,8 @@ class TextTools {
     this.buf = ""
     this.after = false
     this.tools = tools
+    this.sent = "" // the text given out so far, to tell a block in code from a call
+    this.bad = new Set() // where the waiting block's JSON was tried and not read, not tried again
   }
   push(s, end = false) {
     this.buf += s
@@ -907,7 +909,8 @@ class TextTools {
         }
         this.after = false
       }
-      const i = this.buf.indexOf(OPEN)
+      const om = this.buf.match(OPEN_AT)
+      const i = om ? om.index : -1
       const d = this.buf.search(DSML_AT)
       const r = this.buf.search(REASON_AT)
       if (r >= 0 && (i < 0 || r < i) && (d < 0 || r < d)) {
@@ -965,53 +968,271 @@ class TextTools {
         this.after = true
         continue
       }
-      const o = objectEnd(this.buf, i + OPEN.length)
-      const inner = this.buf.slice(i + OPEN.length).trimStart()
-      if (inner.startsWith("<") || (end && !inner)) {
+      const head = this.buf.slice(0, i)
+      const body = this.buf.slice(i + om[0].length)
+      if (quoted(this.sent + text + head)) {
+        // a <tool_call> in backticks or a code fence is prose about one
+        text += head + om[0]
+        this.buf = body
+        continue
+      }
+      const named = om[1]?.match(/\bname\s*=\s*"([^"]+)"/)?.[1]
+      const inner = body.trimStart()
+      if (!named && (inner.startsWith("<") || (end && !inner))) {
         // no JSON in it: DeepSeek's own invoke, or only the closes of one
         // (magpie#823 again); the opener is dropped and what follows read
         // as it is
-        text += this.buf.slice(0, i)
+        text += head
         this.buf = inner
         this.after = true
         continue
       }
-      const v = o > 0 ? looseJSON(this.buf.slice(i + OPEN.length, o)) : null
-      if (v?.name) {
-        text += this.buf.slice(0, i)
-        calls.push({ name: String(v.name), arguments: callArgs(v) })
-        this.buf = this.buf.slice(o)
-        this.after = true
+      const b = this.block(body, named, end)
+      if (b.wait) break
+      this.bad.clear()
+      if (b.text) {
+        // not a call: the opener is text, and what follows read on
+        text += head + om[0]
+        this.buf = body
         continue
       }
-      let j = this.buf.indexOf(CLOSE, i + OPEN.length)
-      if (j < 0) {
-        // GLM's call, cut short at the end, is still the call
-        if (!end || !glmCall(this.buf.slice(i + OPEN.length), this.tools)) break
-        j = this.buf.length
+      text += head
+      if (b.error) {
+        // a call that can't be read is not the answer (plugins#38): the
+        // turn ends as a failure, so the gateway can try it again
+        this.buf = ""
+        this.sent += text
+        return { text, calls, reasoning, error: b.error }
       }
-      text += this.buf.slice(0, i)
-      const raw = this.buf.slice(i + OPEN.length, j).trim()
-      this.buf = this.buf.slice(j + CLOSE.length)
-      const w = looseJSON(raw) ?? glmCall(raw, this.tools) ?? {}
-      if (w.name) {
-        calls.push({ name: String(w.name), arguments: callArgs(w) })
-        this.after = true
-      } else text += OPEN + raw + CLOSE
+      calls.push(b.call)
+      this.buf = b.rest
+      this.after = true
     }
     if (end) {
       text += this.buf
       this.buf = ""
     } else {
       // keep back an opened block, or what may be the start of one
-      const at = [this.buf.indexOf(OPEN), this.buf.search(DSML_AT), this.buf.search(REASON_AT)].filter((x) => x >= 0)
+      const at = [this.buf.search(OPEN_AT), this.buf.search(OPEN_HOLD), this.buf.search(DSML_AT), this.buf.search(REASON_AT)].filter((x) => x >= 0)
       let keep = at.length ? this.buf.length - Math.min(...at) : 0
       if (!keep) for (let k = Math.min(MARK_MAX - 1, this.buf.length); k > 0; k--) if (MARKS.some((m) => m.startsWith(this.buf.slice(-k)))) { keep = k; break }
       text += this.buf.slice(0, this.buf.length - keep)
       this.buf = this.buf.slice(this.buf.length - keep)
     }
+    this.sent += text
     return { text, calls, reasoning }
   }
+
+  // block reads what follows a <tool_call> opener: {call, rest} for a
+  // call, {wait} while it may still become one, {text} when it is no call
+  // at all, {error} for one that can't be read: cut short, or not JSON
+  // even as models get it wrong (plugins#38). named is the name an opener
+  // gave as <tool_call name="…">.
+  block(body, named, end) {
+    if (!end && !body.trim()) return { wait: true }
+    const close = body.indexOf(CLOSE)
+    if (named) {
+      if (close < 0 && !end) return { wait: true }
+      const region = close >= 0 ? body.slice(0, close) : body
+      const rest = close >= 0 ? body.slice(close + CLOSE.length) : ""
+      if (region.trimStart().startsWith("{")) {
+        const v = repairedJSON(region.trim())
+        if (!v) return { error: close >= 0 ? UNREADABLE : CUT_SHORT }
+        return { call: v.name ? { name: String(v.name), arguments: callArgs(v) } : { name: named, arguments: JSON.stringify(v) }, rest }
+      }
+      if (region.includes("<arg_key>")) {
+        const w = glmCall(named + region, this.tools)
+        return w ? { call: { name: w.name, arguments: callArgs(w) }, rest } : { error: close >= 0 ? UNREADABLE : CUT_SHORT }
+      }
+      const p = paramArgs(region, named, this.tools)
+      // cut short at the end: whole only when each parameter was closed
+      if (close < 0 && !p.closed) return { error: CUT_SHORT }
+      return { call: { name: named, arguments: JSON.stringify(p.args) }, rest }
+    }
+    if (body.trimStart().startsWith("{")) {
+      const ph = body.match(PARAM_HEAD)
+      if (ph) {
+        // DeepSeek's half-and-half: the name as JSON, then its parameters
+        // (magpie#917)
+        if (close < 0 && !end) return { wait: true }
+        const region = body.slice(ph[0].length, close >= 0 ? close : body.length)
+        const p = paramArgs(region, ph[1], this.tools)
+        if (close < 0 && !p.closed) return { error: CUT_SHORT }
+        return { call: { name: ph[1], arguments: JSON.stringify(p.args) }, rest: close >= 0 ? body.slice(close + CLOSE.length) : "" }
+      }
+      const o = objectEnd(body, 0)
+      if (o > 0 && !this.bad.has(":" + o)) {
+        const v = callJSON(body.slice(0, o))
+        // a name alone may have its parameters still to come
+        if (v && !end && Object.keys(v).length === 1 && "<parameter".startsWith(body.slice(o).replace(/^\s*>?\s*/, ""))) return { wait: true }
+        if (v) return { call: { name: String(v.name), arguments: callArgs(v) }, rest: body.slice(o) }
+        this.bad.add(":" + o)
+      }
+      // not whole, or not JSON as it stands: read up to a close (a file's
+      // content may hold one), or at the end all of it
+      for (let j = close; j >= 0; j = body.indexOf(CLOSE, j + 1)) {
+        if (this.bad.has("<" + j)) continue
+        const v = callJSON(body.slice(0, j))
+        if (v) return { call: { name: String(v.name), arguments: callArgs(v) }, rest: body.slice(j + CLOSE.length) }
+        this.bad.add("<" + j)
+      }
+      if (!end) return { wait: true }
+      const v = callJSON(body)
+      if (v) return { call: { name: String(v.name), arguments: callArgs(v) }, rest: "" }
+      return { error: close >= 0 ? UNREADABLE : CUT_SHORT }
+    }
+    // GLM's own (a name, then <arg_key>/<arg_value> pairs), or text
+    if (!/^\s*[\w.:-]{1,128}\s*(?:<|$)/.test(body)) return { text: true }
+    if (close < 0 && !end) return { wait: true }
+    const region = close >= 0 ? body.slice(0, close) : body
+    const w = glmCall(region, this.tools)
+    // GLM's call, cut short at the end, is still the call
+    if (w) return { call: { name: w.name, arguments: callArgs(w) }, rest: close >= 0 ? body.slice(close + CLOSE.length) : "" }
+    if (/^\s*[\w.:-]{1,128}\s*<arg_key>/.test(body)) return { error: close >= 0 ? UNREADABLE : CUT_SHORT }
+    return { text: true }
+  }
+}
+
+const CUT_SHORT = "the model's tool call, written as text, was cut short; it is not sent on as the answer"
+const UNREADABLE = "the model's tool call, written as text, can't be read; it is not sent on as the answer"
+
+// an opener: <tool_call>, one with attributes (<tool_call name="bash">),
+// or <tool_call right before its JSON; and one still being written
+const OPEN_AT = /<tool_call(?:(\s[^<>{}]*)?>|(?=\s*\{))/
+const OPEN_HOLD = /<tool_call(?:\s[^<>{}\n]{0,200})?$/
+// DeepSeek's half-and-half call: {"name":"x"} (or its brace or > left
+// out), then <parameter name="k">v</parameter> or Qwen's <parameter=k>
+const PARAM_HEAD = /^\s*\{\s*"name"\s*:\s*"([^"]+)"\s*\}?\s*>?\s*(?=<parameter\b)/
+const PARAM_OPEN = /<parameter(?:\s+name\s*=\s*"([^"]+)"|=([^\s>]+))\s*>/g
+
+// quoted says text ends inside a code fence or inline code: what comes
+// next is shown, not done
+function quoted(text) {
+  if ((text.match(/```/g)?.length ?? 0) % 2) return true
+  const line = text.slice(text.lastIndexOf("\n") + 1).replace(/```/g, "")
+  return (line.match(/`/g)?.length ?? 0) % 2 === 1
+}
+
+// paramArgs reads <parameter name="k">v</parameter> (or <parameter=k>)
+// arguments; a value runs to its close, the next parameter or the end. A
+// value is its text where the tool's schema says string (or it isn't
+// JSON), else its JSON. closed says each one had its close.
+function paramArgs(s, name, tools = []) {
+  const props = (tools.find((t) => (t.function ?? t)?.name === name)?.function ?? {}).parameters?.properties ?? {}
+  const opens = [...s.matchAll(PARAM_OPEN)]
+  const args = {}
+  let closed = opens.length > 0
+  opens.forEach((m, k) => {
+    const from = m.index + m[0].length
+    const to = k + 1 < opens.length ? opens[k + 1].index : s.length
+    let v = s.slice(from, to)
+    const c = v.indexOf("</parameter>")
+    if (c >= 0) v = v.slice(0, c)
+    else closed = false
+    v = v.replace(/^\r?\n|\r?\n$/g, "")
+    const key = m[1] ?? m[2]
+    if (props[key]?.type === "string") {
+      args[key] = v
+      return
+    }
+    try {
+      args[key] = JSON.parse(v.trim())
+    } catch {
+      args[key] = v
+    }
+  })
+  return { args, closed }
+}
+
+// callJSON is a block's call ({name, …}) as a model may get its JSON
+// wrong, null when it isn't one even so
+function callJSON(s) {
+  const v = repairedJSON(s)
+  return v && typeof v.name === "string" && v.name ? v : null
+}
+
+// repairedJSON reads a JSON object as looseJSON does, and else as models
+// get it wrong (plugins#38): every quote escaped ({\"name\":…}), a
+// backslash that escapes nothing JSON knows (\_ \| C:\Users in a file's
+// content), or quotes inside a string left unescaped ("官方" in a write's
+// content)
+function repairedJSON(s) {
+  const v = looseJSON(s)
+  if (v) return v
+  const t = escapeRaw(s)
+  const tries = []
+  if (/^\s*\{\s*\\"/.test(s)) {
+    try {
+      const u = JSON.parse('"' + s.trim().replace(/[\n\r\t]/g, (c) => (c === "\n" ? "\\n" : c === "\r" ? "\\r" : "\\t")) + '"')
+      tries.push(u, escapeRaw(u))
+    } catch {}
+    tries.push(s.replace(/\\"/g, '"'))
+  }
+  tries.push(fixEscapes(t), quoteFix(fixEscapes(t)))
+  for (const x of tries) {
+    try {
+      const v = JSON.parse(x)
+      if (v && typeof v === "object" && !Array.isArray(v)) return v
+    } catch {}
+  }
+  return null
+}
+
+// fixEscapes makes a backslash that escapes nothing JSON knows a backslash
+// of its own (\' is the quote it meant)
+function fixEscapes(s) {
+  return s.replace(/\\(u[0-9a-fA-F]{4}|["\\/bfnrt])|\\'|\\/g, (m, ok) => (ok ? m : m === "\\'" ? "'" : "\\\\"))
+}
+
+// quoteFix escapes the quotes inside strings a model left unescaped: a
+// quote ends a key only before its colon, and a value only before what
+// may follow the last of one (closing braces or brackets, then the end or
+// a comma and the next key or value)
+function quoteFix(s) {
+  let out = ""
+  const stack = []
+  let key = false
+  for (let i = 0; i < s.length; ) {
+    const ch = s[i]
+    if (ch !== '"') {
+      if (ch === "{") {
+        stack.push("{")
+        key = true
+      } else if (ch === "[") stack.push("[")
+      else if (ch === "}" || ch === "]") stack.pop()
+      else if (ch === ",") key = stack.at(-1) === "{"
+      else if (ch === ":") key = false
+      out += ch
+      i++
+      continue
+    }
+    const isKey = key && stack.at(-1) === "{"
+    const inArray = stack.at(-1) === "["
+    out += ch
+    i++
+    for (; i < s.length; i++) {
+      const c = s[i]
+      if (c === "\\") {
+        out += c + (s[i + 1] ?? "")
+        i++
+        continue
+      }
+      if (c !== '"') {
+        out += c
+        continue
+      }
+      const after = s.slice(i + 1)
+      const ends = isKey ? /^\s*:/.test(after) : (inArray ? /^\s*(?:[}\]]\s*)*(?:$|,\s*["{[\d\-tfn])/ : /^\s*(?:[}\]]\s*)*(?:$|,\s*")/).test(after)
+      if (ends) {
+        out += c
+        i++
+        break
+      }
+      out += '\\"'
+    }
+    key = false
+  }
+  return out
 }
 
 // GLM's call template: the tool's name, then each argument as
@@ -1333,6 +1554,10 @@ async function* parts(events, tools = []) {
       if (t) yield { reasoning: t }
       if (r.text) yield { text: r.text }
       for (const c of r.calls) yield call({ ...c, id: callId() })
+      if (r.error) {
+        yield { error: r.error, code: null }
+        return
+      }
     }
     for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) nc.push(tc)
     const u = tokensOf(d.usage)
@@ -1345,6 +1570,10 @@ async function* parts(events, tools = []) {
   if (t) yield { reasoning: t }
   if (r.text) yield { text: r.text }
   for (const c of r.calls) yield call({ ...c, id: callId() })
+  if (r.error) {
+    yield { error: r.error, code: null }
+    return
+  }
   for (const c of nc.take(tools)) yield call(c)
   if (finish) yield { finish }
 }

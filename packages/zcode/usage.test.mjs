@@ -276,7 +276,8 @@ test("a model ZCode's config gives no limits has none made up", () => {
 // the app's captcha attestation, see claimHint). Both fixtures are real
 // responses: one account's preview while the day's ZCode Trust Build was
 // still unclaimed, and one after it had claimed it. The plugin never asks
-// the claim endpoint.
+// the claim endpoint. The window's name is the fixed sentence magpie
+// translates; the count and the plan's own name are the display.
 const PREVIEW_CLAIMABLE = {
   server_time: 1791216750,
   plans: [{
@@ -287,7 +288,7 @@ const PREVIEW_CLAIMABLE = {
   }],
 }
 const PREVIEW_CLAIMED = { server_time: 1791276990, plans: [] }
-const TRUST_BUILD = { name: "ZCode Trust Build", used: 0, aside: true, display: "1 to claim · claim it in the ZCode app" }
+const TRUST_BUILD = { name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "1 · ZCode Trust Build" }
 
 // the Start Plan's own card, with the preview answering what preview says
 async function startCard(now, token, preview) {
@@ -364,7 +365,7 @@ test("several claimable plans are counted", async () => {
   const now = Math.trunc(Date.now() / 1000)
   const two = { ...PREVIEW_CLAIMABLE, plans: [PREVIEW_CLAIMABLE.plans[0], { plan_id: "zcode-v3-start-plan-trust-1007", name: "ZCode Trust Build", status: "active" }] }
   const { u } = await startCard(now, jwt(now + 86400), () => ok(two))
-  expect(u.windows.at(-1)).toEqual({ name: "ZCode Trust Build", used: 0, aside: true, display: "2 to claim · claim them in the ZCode app" })
+  expect(u.windows.at(-1)).toEqual({ name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "2 · ZCode Trust Build" })
 })
 
 // a coding account with gift plans: the line goes last, after both allowances
@@ -380,7 +381,7 @@ test("a coding account's line goes after its coding and gift windows", async () 
   const auth = oauth({ site: "zai", key: "k", jwt: token, device: "d" })
   const u = await usage(auth)
   expect(u.plan).toBe("GLM Coding Pro")
-  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "GLM-5.1-Trial", "ZCode Trust Build"])
+  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "GLM-5.1-Trial", "Gift plans to claim in the ZCode app"])
   expect(u.windows.at(-1)).toEqual(TRUST_BUILD)
   expect(calls.filter((c) => c.url.pathname.endsWith("/preview"))).toHaveLength(1)
 })

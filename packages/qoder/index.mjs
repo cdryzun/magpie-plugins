@@ -25,8 +25,21 @@
 // gateway.qoder.com.cn, with the device-flow client id that CLI sends in
 // production and no redirect_uri. That CLI chats on the device token itself;
 // if qoder.cn won't trade it for a job token, the account does the same.
+//
+// A Qoder CN enterprise VPC account (yetone/magpie#312) is signed in to with
+// its own method, which asks for the enterprise's instance name. Its calls go
+// to the same paths on the instance's own hosts, as Qoder CN's CLI 1.1.64
+// rewrites them once a VPC instance is set: qoder.cn becomes
+// <instance>.vpc.qoder.com.cn, openapi.qoder.com.cn becomes
+// <instance>-openapi.vpc.qoder.com.cn, and gateway.qoder.com.cn becomes
+// <instance>-gateway.vpc.qoder.com.cn. The instance is kept on the account,
+// and an account with none is served as before.
 import { createCipheriv, createHash, publicEncrypt, randomBytes, randomUUID, constants } from "node:crypto"
+import { execFile } from "node:child_process"
+import { readdir, stat } from "node:fs/promises"
 import { STATUS_CODES } from "node:http"
+import { homedir } from "node:os"
+import { join, resolve } from "node:path"
 
 const CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 const MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -180,6 +193,59 @@ function deviceExpiry(dt) {
   return Date.now() + DAY
 }
 
+// ---- enterprise VPC (Qoder CN) --------------------------------------------------
+
+const VPC_NAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i
+
+// vpcInstance is the instance named by what the user entered, as Qoder CN's
+// CLI reads its VPC endpoint: a bare name ("acme"), or one of the instance's
+// hosts (acme.vpc.qoder.com.cn, acme-openapi.…, acme-gateway.…), here also as
+// an https:// address with no path. Anything else (http://, an IP, another
+// domain, a path or query) names none: undefined.
+function vpcInstance(input, domain) {
+  let e = String(input ?? "").trim().toLowerCase()
+  if (!e || !domain) return undefined
+  if (/^[a-z][a-z\d+.-]*:\/\//.test(e)) {
+    let u
+    try {
+      u = new URL(e)
+    } catch {
+      return undefined
+    }
+    if (u.protocol !== "https:" || u.username || u.password || u.port || u.search || u.hash || (u.pathname !== "" && u.pathname !== "/")) return undefined
+    if (e.endsWith("/")) e = e.slice(0, -1)
+    if (u.hostname + "" !== e.slice("https://".length)) return undefined
+    e = u.hostname
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(e)) return undefined
+  let name = e
+  if (e.endsWith("." + domain)) {
+    name = e.slice(0, e.length - domain.length - 1)
+    if (name.endsWith("-openapi") || name.endsWith("-gateway")) name = name.slice(0, -8)
+  } else if (e.includes(".")) return undefined
+  return VPC_NAME.test(name) ? name : undefined
+}
+
+// vpcSite is site served from a VPC instance's own hosts, the paths
+// unchanged; undefined when the site has no VPC or instance names none.
+function vpcSite(site, instance) {
+  const name = vpcInstance(instance, site.vpcDomain)
+  if (!name) return undefined
+  const d = site.vpcDomain
+  return { ...site, web: `https://${name}.${d}`, openapi: `https://${name}-openapi.${d}`, api: `https://${name}-gateway.${d}`, vpc: name }
+}
+
+// siteOf is the site an account is served from: its VPC instance's when it
+// was signed in to one, else site. An instance on record that names none
+// is not read as "no VPC", which would send the enterprise's tokens to the
+// public hosts: the account has to be signed in to again.
+function siteOf(site, a) {
+  if (a?.vpc === undefined || a?.vpc === null || a?.vpc === "") return site
+  const s = vpcSite(site, a.vpc)
+  if (!s) throw new SignInGone(`${site.name}: the account's VPC instance "${a.vpc}" isn't one; sign in again`)
+  return s
+}
+
 async function deviceSignIn(site) {
   const verifier = b64url(randomBytes(64))
   const challenge = b64url(createHash("sha256").update(verifier).digest())
@@ -217,20 +283,29 @@ async function deviceSignIn(site) {
       } else throw new Error(`${site.name} job token: status ${jr.status}: ${jr.text.trim().slice(0, 300)}`)
       let email = ""
       let name = ""
+      let uid = dt.user_id
       try {
         const ui = await openapi(site, "/api/v1/userinfo", { token: dt.token })
-        if (ui.status >= 200 && ui.status < 300) [email, name] = [ui.json?.email ?? "", ui.json?.name ?? ""]
+        if (ui.status >= 200 && ui.status < 300) {
+          ;[email, name] = [ui.json?.email ?? "", ui.json?.name ?? ""]
+          // a VPC poll may give the token alone: the user is then the one
+          // user info names (id, or its user_id / uid aliases)
+          if (site.vpc && !String(uid ?? "").trim()) uid = String(ui.json?.id ?? ui.json?.user_id ?? ui.json?.uid ?? "") || undefined
+        }
       } catch {}
+      if (site.vpc && !String(uid ?? "").trim()) throw new Error(`${site.name} (${site.vpc}): the sign-in named no user`)
       return {
         type: "success",
         ...chat,
-        accountId: email || dt.user_id,
-        uid: dt.user_id,
+        // a VPC account is told apart from the same person's public one
+        accountId: site.vpc ? `${email || uid} (${site.vpc})` : email || dt.user_id,
+        uid,
         email,
         name: name || dt.user_name || "",
         machineId,
         deviceToken: dt.token,
         deviceRefresh: dt.refresh_token ?? "",
+        ...(site.vpc ? { vpc: site.vpc } : {}),
       }
     },
   }
@@ -957,6 +1032,59 @@ async function fetchUsage(site, deviceToken) {
 // credits among them (actionType CLAIM_BENEFIT) — and claims one
 // (POST …/{id}/claim), as Qoder's client does, on the device token.
 const CAMPAIGNS = "/sash/api/v1/me/campaigns"
+const CAMPAIGN_MACHINE_TTL = 60 * 60 * 1000 // Qoder's desktop client renews its native identity hourly
+
+// campaignRuntime uses Qoder's own native device identity helper, installed
+// by its desktop client or cached by its CLI. A made-up token (including the
+// chat envelope's machine id and type 5) doesn't reveal international claims.
+async function campaignRuntime({ home = homedir(), platform = process.platform, arch = process.arch, env = process.env } = {}) {
+  if (env.QODER_RUNTIME_INFO) return resolve(env.QODER_RUNTIME_INFO)
+  const name = platform === "win32" ? "runtime-info.exe" : "runtime-info"
+  const paths = []
+  if (platform === "win32") {
+    const local = env.LOCALAPPDATA || join(home, "AppData", "Local")
+    paths.push(join(local, "Programs", "Qoder", "resources", "umid", name))
+  } else if (platform === "darwin") {
+    for (const dir of ["/Applications", join(home, "Applications")]) paths.push(join(dir, "Qoder.app", "Contents", "Resources", "umid", name))
+  }
+  for (const path of paths) if ((await stat(path).catch(() => null))?.isFile()) return path
+  const cache = join(home, ".qoder", ".bin")
+  const dirs = (await readdir(cache, { withFileTypes: true }).catch(() => []))
+    .filter((d) => d.isDirectory() && d.name.startsWith(`umid-${platform}-${arch}-`))
+  const cached = await Promise.all(dirs.map(async (d) => ({ path: join(cache, d.name, name), time: (await stat(join(cache, d.name))).mtimeMs })))
+  for (const { path } of cached.sort((a, b) => b.time - a.time)) if ((await stat(path).catch(() => null))?.isFile()) return path
+  throw new Error("Qoder check-in: device identity runtime not found; install Qoder desktop or run Qoder CLI, or set QODER_RUNTIME_INFO to its runtime-info executable")
+}
+
+// Read the SDK identity as Qoder does: environment 3 is international; on
+// Windows and macOS the uid goes over stdin, never into the command line.
+async function campaignMachine(uid) {
+  if (!uid) throw new Error("Qoder check-in: device identity needs the account uid; sign in again")
+  const file = await campaignRuntime()
+  const args = process.platform === "linux" ? ["3"] : ["3", "--account-stdin"]
+  const text = await new Promise((resolve, reject) => {
+    const child = execFile(file, args, { timeout: 20_000, windowsHide: true, maxBuffer: 1 << 20 }, (err, out) => {
+      if (err) reject(err)
+      else resolve(out)
+    })
+    child.stdin?.on("error", () => {})
+    child.stdin?.end(process.platform === "linux" ? undefined : JSON.stringify({ account: uid }) + "\n")
+  }).catch(() => {
+    throw new Error("Qoder check-in: could not read device identity; restart or update Qoder, or check QODER_RUNTIME_INFO")
+  })
+  try {
+    const identity = JSON.parse(text.trim().split(/\r?\n/, 1)[0])
+    const headers = {}
+    for (const [key, field] of [["Cosy-MachineToken", "machineToken"], ["Cosy-MachineType", "machineType"]]) {
+      const value = identity?.[field]?.trim()
+      if (!value || value.length > 4096 || !/^[\x20-\x7e]+$/.test(value)) throw new Error("invalid identity")
+      headers[key] = value
+    }
+    return headers
+  } catch {
+    throw new Error("Qoder check-in: invalid device identity from Qoder; restart or update Qoder")
+  }
+}
 
 // campaignPage: url is the site's campaigns page or a claim under it, which
 // the account's fetch sends as the account rather than as a chat.
@@ -969,12 +1097,27 @@ function campaignPage(site, url) {
   }
 }
 
+// campaignTarget is where a campaigns page url is asked for an account
+// served from s: url itself on s's accounts host, or, on a VPC account, the
+// same page on its instance when url names the public host (magpie's
+// check-in knows only that), as Qoder CN's CLI rewrites it. null: url isn't
+// one.
+function campaignTarget(base, s, url) {
+  if (campaignPage(s, url)) return url
+  if (s === base || !campaignPage(base, url)) return null
+  const u = new URL(url)
+  const to = new URL(s.openapi)
+  u.protocol = to.protocol
+  u.host = to.host
+  return u.href
+}
+
 // campaignCall is url asked with the device token; Qoder's answer comes back
 // as it is.
-async function campaignCall(url, method, body, deviceToken, signal) {
+async function campaignCall(url, method, body, deviceToken, machine, signal) {
   return fetch(url, {
     method,
-    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${deviceToken}`, "Cosy-ClientType": "10", "User-Agent": "Qoder" },
+    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${deviceToken}`, "Cosy-ClientType": "10", "User-Agent": "Qoder", ...machine },
     body: method === "GET" ? undefined : body || "{}",
     signal: signal ?? AbortSignal.timeout(20_000),
   })
@@ -1080,13 +1223,32 @@ const SITES = {
     api: "https://gateway.qoder.com.cn",
     redirect: "", // Qoder CN's CLI sends none
     deviceChat: true, // a refused job token falls back to the CLI's device-token chat
+    // an enterprise's own instance, <instance>.vpc.qoder.com.cn and its
+    // -openapi and -gateway hosts, as Qoder CN's CLI builds it in
+    vpcDomain: "vpc.qoder.com.cn",
     models: CN_MODELS,
   },
 }
 
 const makePlugin = (site) => async ({ client }) => {
   const ID = site.id
-  const CHAT_URL = site.api + CHAT_PATH
+  // The SDK identity is account-specific. Share an in-flight read, refresh
+  // after an hour, and leave a failed read available for the next attempt.
+  const campaignMachines = new Map()
+  const machineForCampaign = async (uid) => {
+    const now = Date.now()
+    let entry = campaignMachines.get(uid)
+    if (!entry || now - entry.at >= CAMPAIGN_MACHINE_TTL) {
+      entry = { at: now, promise: campaignMachine(uid) }
+      campaignMachines.set(uid, entry)
+    }
+    try {
+      return await entry.promise
+    } catch (e) {
+      if (campaignMachines.get(uid) === entry) campaignMachines.delete(uid)
+      throw e
+    }
+  }
   // serializes checking, rotating and saving tokens: a refresh token is
   // spent once, so two refreshes would spend it twice
   let lock = Promise.resolve()
@@ -1118,13 +1280,14 @@ const makePlugin = (site) => async ({ client }) => {
   // renew spends a's chat refresh token, under the lock: the fields it
   // changes, recorded in spent.
   const renew = async (a) => {
+    const s = siteOf(site, a)
     if (a.deviceChat) {
       // the device token is the chat token: renewed as a device token,
       // both pairs being the one pair
-      const dt = await refreshDevice(site, a.refresh, true)
+      const dt = await refreshDevice(s, a.refresh, true)
       return spend(a.refresh, { access: dt.token, refresh: dt.refresh, expires: dt.expires, deviceToken: dt.token, deviceRefresh: dt.refresh })
     }
-    const jt = await refreshJob(site, a.refresh, a.accountId || a.email || a.uid)
+    const jt = await refreshJob(s, a.refresh, a.accountId || a.email || a.uid)
     return spend(a.refresh, { access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) })
   }
   // each account's listing, the model configs a request carries
@@ -1147,6 +1310,7 @@ const makePlugin = (site) => async ({ client }) => {
     locked(async () => {
       const stored = await getAuth()
       if (stored?.type !== "oauth" || !stored.access || !stored.uid) throw new SignInGone(`${site.name}: not signed in`)
+      siteOf(site, stored) // a VPC instance on record that names none is no sign-in
       // renewed already (by magpie's auth.refresh), the store not yet saying so
       const a = latest(stored)
       if (a.expires - Date.now() > REFRESH_LEAD) return a
@@ -1159,7 +1323,7 @@ const makePlugin = (site) => async ({ client }) => {
   const models = async (cred, again = false) => {
     let l = listings.get(cred.uid)
     if (!l || again) {
-      l = modelInfos(await fetchListing(site, cred))
+      l = modelInfos(await fetchListing(siteOf(site, cred), cred))
       listings.set(cred.uid, l)
     }
     return l
@@ -1171,7 +1335,7 @@ const makePlugin = (site) => async ({ client }) => {
     locked(async () => {
       const a = latest(await getAuth())
       if (a?.deviceToken !== attempted) return a?.deviceToken
-      const dt = await refreshDevice(site, a.deviceRefresh, !!a.deviceChat)
+      const dt = await refreshDevice(siteOf(site, a), a.deviceRefresh, !!a.deviceChat)
       const next = { ...a, deviceToken: dt.token, deviceRefresh: dt.refresh }
       // the pair it spent was the chat pair too
       if (a.deviceChat) Object.assign(next, spend(a.refresh, { access: dt.token, refresh: dt.refresh, expires: dt.expires, deviceToken: dt.token, deviceRefresh: dt.refresh }))
@@ -1190,10 +1354,10 @@ const makePlugin = (site) => async ({ client }) => {
       if (renewed(cred)) signIn = "renewed"
       let env
       try {
-        env = await fetchUsage(site, cred.deviceToken)
+        env = await fetchUsage(siteOf(site, cred), cred.deviceToken)
       } catch (e) {
         if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
-        env = await fetchUsage(site, await deviceToken(getAuth, cred.deviceToken))
+        env = await fetchUsage(siteOf(site, cred), await deviceToken(getAuth, cred.deviceToken))
       }
       return { ...parseUsage(env), signIn }
     } catch (e) {
@@ -1208,13 +1372,16 @@ const makePlugin = (site) => async ({ client }) => {
     let cred
     try {
       cred = await fresh(getAuth)
+      url = campaignTarget(site, siteOf(site, cred), url)
     } catch (e) {
       return signedInError(e)
     }
+    if (!url) return errorResponse({ status: 404, message: "only chat completions are served" })
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase()
     try {
-      let res = await campaignCall(url, method, body, cred.deviceToken, init.signal)
-      if (res.status === 401 || res.status === 403) res = await campaignCall(url, method, body, await deviceToken(getAuth, cred.deviceToken), init.signal)
+      const machine = site.id === "qoder" ? await machineForCampaign(cred.uid) : {}
+      let res = await campaignCall(url, method, body, cred.deviceToken, machine, init.signal)
+      if (res.status === 401 || res.status === 403) res = await campaignCall(url, method, body, await deviceToken(getAuth, cred.deviceToken), machine, init.signal)
       return signed(res, renewed(cred))
     } catch (e) {
       if (e?.expired) return signedInError(e)
@@ -1240,6 +1407,7 @@ const makePlugin = (site) => async ({ client }) => {
       return errorResponse({ status: 400, message: e.message })
     }
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
+    const CHAT_URL = siteOf(site, cred).api + CHAT_PATH
     const wire = encodeBody(JSON.stringify(qoderBody(chat, m)))
     const headers = {
       ...cosyHeaders(CHAT_URL, cred, wire),
@@ -1286,13 +1454,17 @@ const makePlugin = (site) => async ({ client }) => {
       async loader(getAuth) {
         const a = await getAuth()
         if (a?.type !== "oauth") return {}
+        let base = site
+        try {
+          base = siteOf(site, a)
+        } catch {} // its requests say so
         return {
-          baseURL: site.api,
+          baseURL: base.api,
           apiKey: "qoder",
           // every chat completion written as Qoder's own request
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
-            if (campaignPage(site, url)) return campaign(getAuth, input, url, init)
+            if (campaignPage(site, url) || campaignPage(base, url)) return campaign(getAuth, input, url, init)
             if (!/\/chat\/completions$/.test(new URL(url).pathname))
               return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
@@ -1311,7 +1483,33 @@ const makePlugin = (site) => async ({ client }) => {
           },
         }
       },
-      methods: [{ type: "oauth", label: `Sign in with ${site.name}`, authorize: () => deviceSignIn(site) }],
+      methods: [
+        { type: "oauth", label: `Sign in with ${site.name}`, authorize: () => deviceSignIn(site) },
+        // an enterprise VPC instance (Qoder CN), a method of its own so
+        // that the sign-in above asks nothing new
+        ...(site.vpcDomain
+          ? [
+              {
+                type: "oauth",
+                label: `Sign in with ${site.name} Enterprise (VPC)`,
+                prompts: [
+                  {
+                    type: "text",
+                    key: "vpc",
+                    message: `Your enterprise's VPC instance: its name, or its address (<instance>.${site.vpcDomain})`,
+                    placeholder: `acme or acme.${site.vpcDomain}`,
+                    validate: (v) => (vpcInstance(v, site.vpcDomain) ? undefined : `Not a VPC instance: enter its name (letters, digits, -) or https://<instance>.${site.vpcDomain}`),
+                  },
+                ],
+                authorize: (inputs) => {
+                  const s = vpcSite(site, inputs?.vpc)
+                  if (!s) throw new Error(`Not a VPC instance: ${String(inputs?.vpc ?? "").slice(0, 100)}`)
+                  return deviceSignIn(s)
+                },
+              },
+            ]
+          : []),
+      ],
       usage,
     },
     async config(config) {
@@ -1343,8 +1541,9 @@ const makePlugin = (site) => async ({ client }) => {
         try {
           const ms = await models(cred, true)
           if (!ms.length) return provider.models
+          const s = siteOf(site, cred)
           return Object.fromEntries(
-            ms.map((m) => [m.key, runtimeModel(site, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free, rate: m.rate, rateWas: m.rateWas })]),
+            ms.map((m) => [m.key, runtimeModel(s, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free, rate: m.rate, rateWas: m.rateWas })]),
           )
         } catch {
           return provider.models
@@ -1358,4 +1557,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { campaignPage, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }
+export const _internal = { campaignRuntime, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }

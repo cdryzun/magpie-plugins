@@ -172,7 +172,7 @@ test("Start-first usage includes the upstream claim hint outside the allowances"
   preview = { plans: [{ plan_id: "next-gift", name: "ZCode Trust Build" }] }
   const card = await usage()
   expect(card.windows.at(-1)).toEqual({
-    name: "ZCode Trust Build", used: 0, aside: true, display: "1 to claim · claim it in the ZCode app",
+    name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "1 · ZCode Trust Build",
   })
   expect(card.windows[1].models).toContain("GLM-5.3-Flash")
 })

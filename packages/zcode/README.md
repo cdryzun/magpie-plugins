@@ -112,9 +112,11 @@ coding plan.
 trust-build / gift plans (a day's ZCode Trust Build, say) that are not
 on the account until the ZCode app claims them. The plugin reads the
 app's own list of them (`GET /api/v1/zcode-plan/billing/preview`) with
-the card and names them there — "1 to claim · claim it in the ZCode app"
+the card and names them there — the window is named "Gift plans to
+claim in the ZCode app" and the display shows "1 · ZCode Trust Build"
 — set aside, so the line stops nothing and routing, usage caps and the
-menu bar pass it over. The plugin never claims one: the claim needs the
+menu bar pass it over. The name is a fixed sentence magpie can
+translate; the count and the plan's own name are the display. The plugin never claims one: the claim needs the
 Aliyun captcha attestation only the app's renderer can make. A preview
 that fails, or lists nothing, adds no line at all, and a card that is an
 error keeps its error. Claim the plan in the ZCode app (open it once);
@@ -134,7 +136,10 @@ minutes. When the config can't be read, the plugin falls back to this list:
 | GLM-5.2 | 1M | 128K | none, high, max |
 | GLM-5-Turbo | 200K | 64K | none, high |
 
-The Start Plan has all of these except GLM-5.3.
+The Start Plan's config has all of these except GLM-5.3. An account
+with no GLM Coding Plan also lists every model its gift plans serve under
+the model's own name, as ZCode does (the Start Plan's GLM-5.3 bucket makes
+GLM-5.3 a model), since all of its requests go to the gift anyway.
 
 A gift plan's models appear again as `<model>-Trial` entries, so a
 request can spend the gift's quota on purpose. A trial entry is listed

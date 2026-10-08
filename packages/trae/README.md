@@ -96,6 +96,14 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
     <arg_value>v</arg_value></tool_call>` (a string kept as written, other
     types read as JSON), and sometimes a whole call into a native call's
     name; both are read as the call.
+  - A block is read as models get it wrong too: every quote escaped
+    (`{\"name\":…}`), quotes or backslashes in a string left unescaped, an
+    opener with the name as an attribute (`<tool_call name="bash">` with
+    `<parameter name="k">v</parameter>`), or JSON that is whole when the
+    stream ends without `</tool_call>`. A block that still can't be read,
+    or is cut short, is never sent on as the answer: the reply ends with an
+    error (a 502 without a stream), so the gateway can try again
+    (plugins#38). A `<tool_call>` in backticks or a code fence is text.
   - Calls from either source become OpenAI `tool_calls`. A name matching a
     requested tool but for case or punctuation (`Read`) goes on as the
     request's (`read`); any other goes on as written, so the agent can say

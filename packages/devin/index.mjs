@@ -957,6 +957,26 @@ const NO_RESULT = "Tool use was interrupted and did not produce a result."
 const textOf = (c) =>
   typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("") : ""
 
+// joinSplitCalls joins an assistant message onto the assistant message
+// before it when that one made tool calls: Anthropic takes consecutive
+// assistant messages as one turn, and an agent can send a turn's parallel
+// calls split over two of them, answered together after (yetone/magpie#1275).
+// Answered at the second message, the first calls would be marked
+// interrupted and their real results dropped. msgs is left as it is.
+function joinSplitCalls(msgs) {
+  const out = []
+  for (const m of msgs) {
+    const prev = out.at(-1)
+    if (m?.role === "assistant" && prev?.role === "assistant" && prev.tool_calls?.length) {
+      const content = [textOf(prev.content), textOf(m.content)].filter(Boolean).join("\n\n")
+      out[out.length - 1] = { ...prev, content, tool_calls: [...prev.tool_calls, ...(m.tool_calls ?? [])] }
+      continue
+    }
+    out.push(m)
+  }
+  return out
+}
+
 // effortOf is the effort a request names, as magpie reads it.
 function effortOf(s) {
   const e = String(s ?? "").trim().toLowerCase()
@@ -988,6 +1008,88 @@ function toolDescriptions(tools) {
 
 const joinNonEmpty = (...s) => s.filter(Boolean).join("\n\n")
 
+// objectRoot is a tool's parameters as a plain object at the root, with no
+// anyOf, oneOf or allOf there: Devin's Claude models turn away a request
+// offering a tool whose schema has one ("There is an issue with this
+// request, please try a different model", magpie#1196; Codex desktop's
+// codex_app automation_update has a root oneOf), as Anthropic does behind
+// Factory (magpie#646). It folds the schema as magpie's built-in does
+// (provider.ObjectRoot): allOf's branches are all merged, properties and
+// required alike; of anyOf's and oneOf's object branches the properties are
+// merged, a field each of them requires stays required, and the other
+// branches go; a branch that is a union itself is folded first, so its
+// fields are kept (magpie#1271). Branches may be local $refs. A schema already a plain object
+// is returned as it came; the caller's own is never changed.
+function objectRoot(ps) {
+  return foldRoot(ps, ps, 0)
+}
+
+function foldRoot(root, ps, depth) {
+  if (!isObj(ps)) return ps
+  const has = (k) => Object.hasOwn(ps, k)
+  if (ps.type === "object" && !has("anyOf") && !has("oneOf") && !has("allOf")) return ps
+  const out = { ...ps }
+  const props = { ...(isObj(ps.properties) ? ps.properties : {}) }
+  let required = Array.isArray(ps.required) ? [...ps.required] : []
+  const ref = (b) => {
+    if (!isObj(b)) return null
+    if (typeof b.$ref !== "string" || !b.$ref) return b
+    for (const k of ["$defs", "definitions"]) {
+      const pre = "#/" + k + "/"
+      if (b.$ref.startsWith(pre)) {
+        const d = root[k]?.[b.$ref.slice(pre.length)]
+        return isObj(d) ? d : null
+      }
+    }
+    return null
+  }
+  for (const b of Array.isArray(ps.allOf) ? ps.allOf : []) {
+    const bm = ref(b)
+    if (!bm) continue
+    if (isObj(bm.properties)) for (const [k, v] of Object.entries(bm.properties)) if (!Object.hasOwn(props, k)) props[k] = v
+    if (Array.isArray(bm.required)) required.push(...bm.required)
+  }
+  delete out.allOf
+  const branches = []
+  for (const k of ["anyOf", "oneOf"]) {
+    for (const b of Array.isArray(ps[k]) ? ps[k] : []) {
+      let bm = ref(b)
+      if (!bm) continue
+      // a branch that is itself a union (zod's discriminated create and
+      // update in automation_update) is folded first, not dropped
+      if (depth < 8 && ["anyOf", "oneOf", "allOf"].some((u) => Object.hasOwn(bm, u))) bm = foldRoot(root, bm, depth + 1)
+      if (bm.type !== "object" && !Object.hasOwn(bm, "properties")) continue
+      branches.push(bm)
+    }
+    delete out[k]
+  }
+  // a field every branch requires stays required, beside the root's and
+  // allOf's own, which no branch can drop; a field the root doesn't define
+  // takes each schema the branches give it, as anyOf when they differ
+  let common = null
+  const from = new Map()
+  for (const b of branches) {
+    for (const [k, v] of Object.entries(isObj(b.properties) ? b.properties : {})) {
+      if (Object.hasOwn(props, k)) continue
+      const vs = from.get(k) ?? []
+      if (!vs.some((w) => JSON.stringify(w) === JSON.stringify(v))) vs.push(v)
+      from.set(k, vs)
+    }
+    const br = Array.isArray(b.required) ? b.required : []
+    common = common === null ? [...br] : common.filter((r) => br.includes(r))
+  }
+  for (const [k, vs] of from) props[k] = vs.length === 1 ? vs[0] : { anyOf: vs }
+  for (const r of common ?? []) if (!required.includes(r)) required.push(r)
+  required = [...new Set(required)]
+  out.type = "object"
+  out.properties = props
+  if (required.length) out.required = required
+  else delete out.required
+  return out
+}
+
+const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v)
+
 const osName = () => (process.platform === "win32" ? "windows" : process.platform)
 
 // metadata is what each request says of the client: the CLI's own (with
@@ -1005,7 +1107,7 @@ function build(chat, uid, key) {
     pending = []
   }
   const system = []
-  for (const m of chat.messages ?? []) {
+  for (const m of joinSplitCalls(chat.messages ?? [])) {
     if (m.role === "system" || m.role === "developer") {
       system.push(textOf(m.content))
       continue
@@ -1061,7 +1163,7 @@ function build(chat, uid, key) {
   // describe themselves, and the same words in a message go through
   let tools = (chat.tools ?? [])
     .filter((t) => (!t?.type || t.type === "function") && t.function?.name)
-    .map((t) => ({ name: t.function.name, description: t.function.description ?? "", schema: t.function.parameters }))
+    .map((t) => ({ name: t.function.name, description: t.function.description ?? "", schema: objectRoot(t.function.parameters) }))
   if (chat.tool_choice === "none") tools = []
   const instructions = joinNonEmpty(system.join("\n\n"), toolDescriptions(tools))
   if (instructions) {
@@ -1460,4 +1562,4 @@ export async function DevinAuthPlugin() {
 }
 
 // for tests
-export const _internal = { seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }

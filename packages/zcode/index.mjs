@@ -578,15 +578,23 @@ async function giftOf(s) {
   return out
 }
 
+// CLAIM_HINT is the claim line's name: a fixed sentence, so magpie
+// translates it with the interface's own language (the plan's name and
+// the count are data, and go in the display, which is shown as it came).
+const CLAIM_HINT = "Gift plans to claim in the ZCode app"
+
 // claimHint is the card's line for gift plans ZCode is holding for the
 // account but has not put on it: GET /billing/preview lists them, and
 // only the ZCode app claims one — its claim takes the Aliyun captcha
 // attestation the app's own renderer makes, so the plugin reads the list
 // and asks the user to claim it there. A window, set aside (it is no
 // allowance: using it up stops nothing), so the card shows it and
-// routing, caps and the menu bar pass it over. null when there is
-// nothing to claim, the preview failing or listing none among it: a
-// failed read is no line at all, never a card or a refusal of its own.
+// routing, caps and the menu bar pass it over. The window's name is a
+// fixed sentence, so magpie can translate it (a display is shown as it
+// came); the count and the plan's own name go in the display. null when
+// there is nothing to claim, the preview failing or listing none among
+// it: a failed read is no line at all, never a card or a refusal of its
+// own.
 async function claimHint(s) {
   if (!s.jwt || jwtExpired(s.jwt)) return null
   let d
@@ -598,8 +606,8 @@ async function claimHint(s) {
   const plans = (Array.isArray(d?.plans) ? d.plans : []).filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
   if (!plans.length) return null
   const n = plans.length
-  const name = first(...plans.map((p) => (typeof p?.name === "string" ? p.name : "")), "ZCode gift plan")
-  return { name, used: 0, aside: true, display: `${n} to claim · claim ${n === 1 ? "it" : "them"} in the ZCode app` }
+  const plan = first(...plans.map((p) => (typeof p?.name === "string" ? p.name : "")), "ZCode gift plan")
+  return { name: CLAIM_HINT, used: 0, aside: true, display: `${n} · ${plan}` }
 }
 
 // startUsage is a gift-only account's card: its buckets, or the words
@@ -1459,12 +1467,22 @@ export async function ZCodeAuthPlugin({ client }, { startFlashFirst = false } = 
         if (fell) ms = start ? START_MODELS : MODELS
         const url = s.base + "/v1"
         const out = Object.fromEntries(ms.map((m) => [m.id, model(m, url)]))
-        const details = [...ms, ...modelsOf(cfg, planID(START_BASE)), ...START_MODELS]
+        const details = [...ms, ...modelsOf(cfg, planID(START_BASE)), ...modelsOf(cfg, planID(ZAI_BASE)), ...MODELS]
+        const about = (raw) => details.find((m) => m.id.toLowerCase() === raw.toLowerCase()) ?? { efforts: [] }
+        const has = new Set(Object.keys(out).map((id) => id.toLowerCase()))
         for (const raw of giftNames(gift)) {
+          // a gift-only account's models are its gift's, by their own
+          // names, as ZCode lists them (its Start Plan's GLM-5.3, which the
+          // plan's config leaves out): every request of it goes to the gift
+          // anyway, and the card counts them by that name too (#1261)
+          if (start && !has.has(raw.toLowerCase())) {
+            const plain = about(raw).id ?? raw
+            has.add(raw.toLowerCase())
+            out[plain] = model({ ...about(raw), id: plain }, url)
+          }
           const id = giftID(raw)
           if (out[id]) continue
-          const m = details.find((m) => m.id.toLowerCase() === raw.toLowerCase()) ?? { efforts: [] }
-          out[id] = model({ ...m, id }, url)
+          out[id] = model({ ...about(raw), id }, url)
         }
         if (fell) out[Symbol.for("magpie.fellBack")] = true
         return out
